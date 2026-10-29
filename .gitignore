@@ -1,5 +1,24 @@
-/target
-Cargo.lock.orig
-*.deb
-target/generate-rpm
+# Build artifacts
+/target/
 /result
+
+# Packaging output (when built outside target/)
+*.rpm
+*.deb
+*.AppImage
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Patch / tooling backups
+*.orig
+*.rej
+
+# Local env files
+.env
