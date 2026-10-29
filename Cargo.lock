@@ -2044,6 +2044,7 @@ version = "0.1.0"
 dependencies = [
  "margdawn-core",
  "terminal_size",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]

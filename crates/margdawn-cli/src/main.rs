@@ -213,6 +213,8 @@ fn main() {
         opts.ascii = true;
     }
     opts.preserve_blank_lines = cfg.preserve_blank_lines();
+    opts.background = cfg.background_enabled();
+    opts.code_background = cfg.code_background_enabled();
     let code_theme = cfg.code_theme_name().to_string();
     let status = render_to_stdout(&doc, Arc::clone(&resolved.theme), &code_theme, &opts);
     if let Err(e) = status {

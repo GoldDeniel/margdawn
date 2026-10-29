@@ -40,6 +40,14 @@ pub struct Config {
     /// Keep the author's blank lines as vertical space (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preserve_blank_lines: Option<bool>,
+    /// Terminal: paint the document background across the whole width.
+    /// Default: false (blend with the terminal's own background).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    /// Terminal: paint code-block panels and inline-code chips.
+    /// Default: false (keep only foreground colors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_background: Option<bool>,
 }
 
 pub const DEFAULT_FONT_SIZE: f32 = 15.0;
@@ -88,6 +96,16 @@ impl Config {
 
     pub fn preserve_blank_lines(&self) -> bool {
         self.preserve_blank_lines.unwrap_or(true)
+    }
+
+    /// Terminal: paint the document background (default off).
+    pub fn background_enabled(&self) -> bool {
+        self.background.unwrap_or(false)
+    }
+
+    /// Terminal: paint code-block and inline-code backgrounds (default off).
+    pub fn code_background_enabled(&self) -> bool {
+        self.code_background.unwrap_or(false)
     }
 }
 
@@ -243,6 +261,17 @@ mod tests {
     fn config_load_never_fails() {
         // Should not panic even if HOME is unusual.
         let _ = load();
+    }
+
+    #[test]
+    fn background_toggles_parse_and_default_off() {
+        let c: Config =
+            serde_json::from_str(r#"{"background": true, "code_background": true}"#).unwrap();
+        assert!(c.background_enabled());
+        assert!(c.code_background_enabled());
+        let default = Config::default();
+        assert!(!default.background_enabled());
+        assert!(!default.code_background_enabled());
     }
 
     #[test]

@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 margdawn-core = { path = "../margdawn-core" }
 terminal_size = "0.4"
+unicode-width = "0.2"

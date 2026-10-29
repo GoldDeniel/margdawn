@@ -81,7 +81,9 @@ is set in `~/.config/margdawn/config.json`:
   "preserve_blank_lines": true,
   "font_body": "sans",
   "font_heading": "serif",
-  "font_mono": "jetbrainsmono"
+  "font_mono": "jetbrainsmono",
+  "background": false,
+  "code_background": false
 }
 ```
 
@@ -176,12 +178,25 @@ warning: theme `nord` from config.json could not be used (...); falling back to 
 - Terminal mode picks colors based on terminal support: truecolor when
   available, otherwise ANSI-256; output piped into a non-TTY renders plain
   text.
-- Footnotes, tables (natural column widths, cell borders, column alignment,
-  horizontal scroll when wider than the window), task lists, fenced and
-  indented code are supported. Code blocks are syntax highlighted (syntect)
-  in both terminal and GUI, and are full-width in the GUI.
-- The author's blank lines between blocks are preserved as vertical space
-  (toggleable).
+- Footnotes, tables, task lists, fenced and indented code are supported.
+  Code blocks are syntax highlighted (syntect) in both frontends. GUI tables
+  use natural column widths with borders and scroll horizontally when wider
+  than the window; terminal tables are boxed and shrink to fit.
+- The author's blank lines between blocks are preserved as vertical space in
+  the GUI (toggleable). The terminal renderer always uses a single blank line
+  between blocks for a consistent rhythm, like agent CLIs.
+- Terminal output is laid out like glamour/agent CLIs: a 2-column document
+  margin, greedy word wrapping with hanging indents for lists, quotes and
+  footnotes, boxed tables, and optional background panels. `--ascii` (or
+  piping) renders the same layout without ANSI styling.
+- Terminal backgrounds are **off by default**, so margdawn blends with your
+  terminal's own background: only foreground colors are emitted. Two config
+  keys opt in (both `false` by default and terminal-only; the GUI ignores
+  them):
+  - `"background": true` — paint the theme's page background across the
+    terminal width.
+  - `"code_background": true` — paint code-block panels and inline-code chips
+    (works with or without the document background).
 - **Color emoji** render inline in the GUI: Noto Emoji PNGs (Apache-2.0) are
   bundled, with Twemoji (CC-BY 4.0) covering national flags, which Noto does
   not ship. Emoji in the terminal use your terminal font.
@@ -197,7 +212,7 @@ crates/
 ```
 
 ```bash
-cargo test --workspace    # 31 tests
+cargo test --workspace    # 42 tests
 ```
 
 > Fedora/Nobara note: if your editor's rust-analyzer reports bogus errors

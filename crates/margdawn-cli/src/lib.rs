@@ -15,6 +15,10 @@ pub struct ViewOptions {
     pub width: usize,
     /// Keep the document's blank lines between blocks.
     pub preserve_blank_lines: bool,
+    /// Paint the document background (terminal).
+    pub background: bool,
+    /// Paint code-block panels and inline-code chips (terminal).
+    pub code_background: bool,
 }
 
 impl ViewOptions {
@@ -25,6 +29,8 @@ impl ViewOptions {
             hyperlinks: o.hyperlinks,
             width: o.width,
             preserve_blank_lines: true,
+            background: false,
+            code_background: false,
         }
     }
 }
@@ -42,6 +48,8 @@ pub fn render_to_stdout(
         hyperlinks: !opts.ascii && opts.hyperlinks,
         width: opts.width,
         preserve_blank_lines: opts.preserve_blank_lines,
+        background: opts.background,
+        code_background: opts.code_background,
     };
     ansi::render(&mut lock, doc, theme, code_theme, &a_opts)?;
     lock.flush()

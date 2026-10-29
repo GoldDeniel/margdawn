@@ -74,7 +74,10 @@ pub struct Document {
 }
 
 pub fn parse(src: &str) -> Document {
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     Builder::run(src, Parser::new_ext(src, options))
 }
 
