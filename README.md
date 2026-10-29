@@ -1,3 +1,5 @@
+![Margdawn logo](./crates/margdawn-gui/assets/margdown_cover.jpg)
+
 # margdawn
 
 A minimal, fast Markdown viewer in Rust — one codebase, two frontends:
