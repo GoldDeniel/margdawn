@@ -1,0 +1,70 @@
+[package]
+name = "margdawn-gui"
+description = "Minimal Markdown viewer (desktop)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+margdawn-core = { path = "../margdawn-core" }
+eframe = { workspace = true }
+rfd = { workspace = true }
+png = "0.17"
+
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "Minimal Markdown viewer (terminal + GUI)"
+auto_req = "builtin"
+post_install_script = "update-desktop-database -q || true"
+post_uninstall_script = "update-desktop-database -q || true"
+
+[[package.metadata.generate-rpm.assets]]
+source = "../../target/release/margdawn"
+dest = "/usr/bin/margdawn"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "../../target/release/margdawn-gui"
+dest = "/usr/bin/margdawn-gui"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "assets/margdawn-gui.desktop"
+dest = "/usr/share/applications/margdawn-gui.desktop"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "assets/margdawn-gui.svg"
+dest = "/usr/share/icons/hicolor/scalable/apps/margdawn-gui.svg"
+mode = "644"
+
+[package.metadata.generate-rpm.requires]
+shared-mime-info = "*"
+
+[package.metadata.deb]
+maintainer = "golddeniel <golddeniel@localhost>"
+depends = "$auto"
+section = "utils"
+priority = "optional"
+extended-description = "A minimal, fast Markdown viewer that renders .md files in a themed GUI (margdawn-gui) or in the terminal (margdawn)."
+
+[[package.metadata.deb.assets]]
+source = "../../target/release/margdawn"
+dest = "/usr/bin/margdawn"
+mode = "755"
+
+[[package.metadata.deb.assets]]
+source = "../../target/release/margdawn-gui"
+dest = "/usr/bin/margdawn-gui"
+mode = "755"
+
+[[package.metadata.deb.assets]]
+source = "assets/margdawn-gui.desktop"
+dest = "/usr/share/applications/margdawn-gui.desktop"
+mode = "644"
+
+[[package.metadata.deb.assets]]
+source = "assets/margdawn-gui.svg"
+dest = "/usr/share/icons/hicolor/scalable/apps/margdawn-gui.svg"
+mode = "644"

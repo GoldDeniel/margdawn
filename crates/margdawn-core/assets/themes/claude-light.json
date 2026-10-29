@@ -1,0 +1,22 @@
+{
+  "name": "claude-light",
+  "appearance": "light",
+  "font_body": "sans",
+  "font_heading": "serif",
+  "colors": {
+    "background": "#FAF9F5",
+    "foreground": "#3D3D3A",
+    "muted": "#73726C",
+    "heading": "#141413",
+    "link": "#C6613F",
+    "code": "#8F4A32",
+    "code_background": "#F0EEE6",
+    "strong": "#141413",
+    "strikethrough": "#9C9A92",
+    "quote": "#5E5D59",
+    "quote_bar": "#D97757",
+    "list_marker": "#D97757",
+    "hr": "#D1CFC5",
+    "table_border": "#D1CFC5"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "claude",
+  "appearance": "dark",
+  "font_body": "sans",
+  "font_heading": "serif",
+  "colors": {
+    "background": "#141413",
+    "foreground": "#E8E6DC",
+    "muted": "#B0AEA5",
+    "heading": "#FAF9F5",
+    "link": "#D97757",
+    "code": "#EBC9B7",
+    "code_background": "#262624",
+    "strong": "#FAF9F5",
+    "strikethrough": "#87867F",
+    "quote": "#B0AEA5",
+    "quote_bar": "#D97757",
+    "list_marker": "#D97757",
+    "hr": "#3D3D3A",
+    "table_border": "#3D3D3A"
+  }
+}

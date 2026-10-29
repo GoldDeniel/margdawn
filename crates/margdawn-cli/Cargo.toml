@@ -1,0 +1,15 @@
+[package]
+name = "margdawn-cli"
+description = "Minimal Markdown viewer for the terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "margdawn"
+path = "src/main.rs"
+
+[dependencies]
+margdawn-core = { path = "../margdawn-core" }
+terminal_size = "0.4"

@@ -1,0 +1,21 @@
+{
+  "name": "monokai-night",
+  "appearance": "dark",
+  "colors": {
+    "background": "#272822",
+    "foreground": "#F8F8F2",
+    "muted": "#8F907B",
+    "heading": "#F92672",
+    "link": "#66D9EF",
+    "code": "#E6DB74",
+    "code_background": "#32332C",
+    "emphasis": "#FD971F",
+    "strong": "#F92672",
+    "strikethrough": "#75715E",
+    "quote": "#75715E",
+    "quote_bar": "#F92672",
+    "list_marker": "#A6E22E",
+    "hr": "#49483E",
+    "table_border": "#49483E"
+  }
+}

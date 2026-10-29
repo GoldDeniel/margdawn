@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Margdawn
+GenericName=Markdown Viewer
+Comment=Read Markdown files in a clean themed viewer
+Exec=margdawn-gui %F
+TryExec=margdawn-gui
+Icon=margdawn-gui
+Terminal=false
+Categories=Utility;Documentation;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;viewer;reader;
+StartupNotify=true
