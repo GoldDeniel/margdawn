@@ -57,6 +57,8 @@ impl RenderCfg {
 struct SectionMeta {
     link: Option<String>,
     emoji: Option<EmojiSlot>,
+    /// inline code: background chip is painted manually (rounded + padded)
+    inline_code: bool,
 }
 
 #[derive(Clone)]
@@ -169,8 +171,10 @@ impl View {
         let mut meta: Vec<SectionMeta> = Vec::new();
         let colors = &self.theme.colors;
         let line_height = Some(size * self.cfg.line_height);
-        let code_bg = c32(colors.code_background());
+        let chip_pad_x = size * 0.24;
         let strike_col = c32(colors.resolve(ColorKey::Strike, ColorKey::Muted));
+        // horizontal space still owed to the previous inline-code chip
+        let mut leading_next = 0.0_f32;
 
         for span in spans {
             let mut color = colors.resolve(span.color, base);
@@ -189,11 +193,17 @@ impl View {
             };
             let font_size = if span.code { size * 0.92 } else { size };
             let font_id = egui::FontId::new(font_size, family);
+            // inline-code chips get padding before/after their text
+            if span.code {
+                job.append("", chip_pad_x, egui::TextFormat::default());
+                meta.push(SectionMeta { link: None, emoji: None, inline_code: false });
+                leading_next = 0.0;
+            }
             let format = egui::TextFormat {
                 font_id: font_id.clone(),
                 line_height,
                 color,
-                background: if span.code { code_bg } else { egui::Color32::TRANSPARENT },
+                background: egui::Color32::TRANSPARENT,
                 underline: if span.link.is_some() {
                     egui::Stroke::new(1.0_f32, color)
                 } else {
@@ -211,8 +221,17 @@ impl View {
             for piece in emoji::split(&span.text) {
                 match piece {
                     Piece::Text(t) => {
-                        job.append(t, 0.0, format.clone());
-                        meta.push(SectionMeta { link: span.link.clone(), emoji: None });
+                        let lead = leading_next;
+                        leading_next = 0.0;
+                        job.append(t, lead, format.clone());
+                        meta.push(SectionMeta {
+                            link: span.link.clone(),
+                            emoji: None,
+                            inline_code: span.code,
+                        });
+                        if span.code {
+                            leading_next = chip_pad_x;
+                        }
                     }
                     Piece::Emoji(cluster) => match self.emoji.resolve(cluster) {
                         Some(key) => {
@@ -228,15 +247,30 @@ impl View {
                                 valign: egui::Align::Center,
                                 ..Default::default()
                             };
-                            job.append("\u{2003}", leading, blank);
+                            let lead = leading_next;
+                            leading_next = 0.0;
+                            job.append("\u{2003}", lead + leading, blank);
                             meta.push(SectionMeta {
                                 link: span.link.clone(),
-                                emoji: Some(EmojiSlot { key, width: leading + em }),
+                                emoji: Some(EmojiSlot {
+                                    key,
+                                    width: lead + leading + em,
+                                }),
+                                inline_code: false,
                             });
                         }
                         None => {
-                            job.append(cluster, 0.0, format.clone());
-                            meta.push(SectionMeta { link: span.link.clone(), emoji: None });
+                            let lead = leading_next;
+                            leading_next = 0.0;
+                            job.append(cluster, lead, format.clone());
+                            meta.push(SectionMeta {
+                                link: span.link.clone(),
+                                emoji: None,
+                                inline_code: span.code,
+                            });
+                            if span.code {
+                                leading_next = chip_pad_x;
+                            }
                         }
                     },
                 }
@@ -254,6 +288,21 @@ impl View {
         meta: &[SectionMeta],
         size: f32,
     ) {
+        // rounded, padded chips behind inline code, hugging the mono font box
+        let chip_fill = c32(self.theme.colors.code_background());
+        let chip_radius = (size * 0.26).max(2.0);
+        let pad_x = size * 0.24;
+        let pad_v = (size * 0.07).max(0.8);
+        let descent = size * 0.92 * 0.30;
+        for run in inline_code_runs(galley, meta) {
+            let top = run.baseline - run.ascent + pad_v * 0.7;
+            let bottom = run.baseline + descent + pad_v;
+            let chip = egui::Rect::from_min_max(
+                egui::pos2(origin.x + run.x0 - pad_x, origin.y + top),
+                egui::pos2(origin.x + run.x1 + pad_x, origin.y + bottom),
+            );
+            ui.painter().rect_filled(chip, chip_radius, chip_fill);
+        }
         ui.painter()
             .galley(origin, galley.clone(), c32(self.theme.colors.foreground()));
         for row in &galley.rows {
@@ -660,6 +709,49 @@ fn glyph_link_rects(galley: &egui::text::Galley, meta: &[SectionMeta]) -> Vec<(e
         if let Some((s, x1, x2)) = run.take() {
             if let Some(url) = meta.get(s).and_then(|m| m.link.clone()) {
                 out.push((run_rect(&row.rect, x1, x2), url));
+            }
+        }
+    }
+    out
+}
+
+/// Geometry of one inline-code run on one row (galley space).
+struct ChipRun {
+    x0: f32,
+    x1: f32,
+    /// baseline of the run's first glyph
+    baseline: f32,
+    /// font ascent of the run's first glyph
+    ascent: f32,
+}
+
+/// Collect inline-code runs, merged per row.
+fn inline_code_runs(galley: &egui::text::Galley, meta: &[SectionMeta]) -> Vec<ChipRun> {
+    let mut out = Vec::new();
+    for row in &galley.rows {
+        // (section, x0, x1, baseline, ascent)
+        let mut run: Option<(usize, f32, f32, f32, f32)> = None;
+        for g in &row.glyphs {
+            let sec = g.section_index as usize;
+            let is_code = meta.get(sec).is_some_and(|m| m.inline_code);
+            let x_end = g.pos.x + g.size.x;
+            match &mut run {
+                Some((s, _, x2, _, _)) if *s == sec && is_code => *x2 = x_end,
+                other => {
+                    if let Some((s, x1, x2, baseline, ascent)) = other.take() {
+                        if meta.get(s).is_some_and(|m| m.inline_code) {
+                            out.push(ChipRun { x0: x1, x1: x2, baseline, ascent });
+                        }
+                    }
+                    if is_code {
+                        run = Some((sec, g.pos.x, x_end, g.pos.y, g.ascent));
+                    }
+                }
+            }
+        }
+        if let Some((s, x1, x2, baseline, ascent)) = run.take() {
+            if meta.get(s).is_some_and(|m| m.inline_code) {
+                out.push(ChipRun { x0: x1, x1: x2, baseline, ascent });
             }
         }
     }

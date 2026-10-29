@@ -30,6 +30,7 @@ pub struct App {
     fonts_key: String,
     theme_editor_name: String,
     theme_editing_colors: Vec<(&'static str, Option<Color>)>,
+    theme_error: Option<String>,
     emoji: Rc<EmojiStore>,
     /// developer hook: `MARGDAWN_SCREENSHOT=out.png` saves a frame and quits
     screenshot: Option<PathBuf>,
@@ -56,6 +57,7 @@ impl App {
             fonts_key: font_key(&cfg),
             theme_editor_name,
             theme_editing_colors,
+            theme_error: None,
             emoji: Rc::new(EmojiStore::new()),
             screenshot: std::env::var_os("MARGDAWN_SCREENSHOT").map(PathBuf::from),
             frames: 0,
@@ -179,7 +181,29 @@ fn apply_visuals(ctx: &egui::Context, theme: &Theme) {
 fn load_theme(name: &str) -> (Arc<Theme>, Option<String>) {
     let dir = config::config_dir();
     match theme::load(&dir, name) {
-        Ok(t) => (Arc::new(t.with_name(name)), None),
+        Ok(mut t) => {
+            // A self-made theme may lack background/foreground → would render
+            // white-on-white. Inherit those from the same-named built-in (or
+            // the default theme) and derive the light/dark mode from the bg.
+            let donor_name = if theme::builtin(name).is_some() {
+                name
+            } else {
+                theme::DEFAULT_THEME
+            };
+            let donor = theme::builtin(donor_name)
+                .or_else(|| theme::builtin(theme::DEFAULT_THEME))
+                .unwrap_or_else(|| {
+                    Theme::new("default", theme::Shade::Dark, theme::Colors::default())
+                });
+            let mut warning = None;
+            if t.inherit_essentials_from(&donor) {
+                warning = Some(format!(
+                    "theme `{name}` is missing background/foreground; inherited them from `{donor_name}`"
+                ));
+            }
+            t.appearance = Some(theme::Shade::from_background(t.colors.background()));
+            (Arc::new(t.with_name(name)), warning)
+        }
         Err(_) => {
             let fallback = theme::builtin(theme::DEFAULT_THEME)
                 .unwrap_or_else(|| Theme::new("default", theme::Shade::Dark, Default::default()));
@@ -191,6 +215,31 @@ fn load_theme(name: &str) -> (Arc<Theme>, Option<String>) {
                 )),
             )
         }
+    }
+}
+
+/// The color a slot resolves to when unset (used to seed the color picker so
+/// an "auto" slot can be turned back into a concrete color).
+fn resolved_slot(theme: &Theme, label: &str) -> Color {
+    let c = &theme.colors;
+    use margdawn_core::theme::ColorKey as K;
+    match label {
+        "background" => c.background(),
+        "foreground" => c.foreground(),
+        "muted" => c.resolve(K::Muted, K::Foreground),
+        "heading" => c.resolve(K::Heading, K::Foreground),
+        "link" => c.resolve(K::Link, K::Foreground),
+        "code" => c.resolve(K::Code, K::Foreground),
+        "code_background" => c.code_background(),
+        "emphasis" => c.resolve(K::Emphasis, K::Foreground),
+        "strong" => c.resolve(K::Strong, K::Foreground),
+        "strikethrough" => c.resolve(K::Strike, K::Muted),
+        "quote" => c.quote.unwrap_or_else(|| c.resolve(K::Muted, K::Foreground)),
+        "quote_bar" => c.quote_bar.unwrap_or_else(|| c.foreground()),
+        "list_marker" => c.list_marker.unwrap_or_else(|| c.foreground()),
+        "hr" => c.hr.unwrap_or_else(|| c.resolve(K::Strike, K::Muted)),
+        "table_border" => c.table_border.unwrap_or_else(|| c.resolve(K::Strike, K::Muted)),
+        _ => c.foreground(),
     }
 }
 
@@ -507,8 +556,11 @@ impl App {
 
                 // ---- theme editor
                 ui.add_space(10.0);
+                let open_editor = std::env::var("MARGDAWN_SETTINGS")
+                    .map(|v| v == "editor")
+                    .unwrap_or(false);
                 egui::CollapsingHeader::new("Theme editor")
-                    .default_open(false)
+                    .default_open(open_editor)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Name:");
@@ -516,40 +568,76 @@ impl App {
                         });
                         ui.add_space(2.0);
                         ui.weak("(unset slots fall back automatically)");
+                        if let Some(err) = &self.theme_error {
+                            ui.colored_label(egui::Color32::from_rgb(200, 80, 60), err);
+                        }
+                        let fallbacks: Vec<Color> = self
+                            .theme_editing_colors
+                            .iter()
+                            .map(|(label, _)| resolved_slot(&self.theme, label))
+                            .collect();
                         let mut any_edit = false;
-                        for (label, color) in self.theme_editing_colors.iter_mut() {
-                            ui.horizontal(|ui| {
-                                ui.monospace(*label);
-                                if let Some(c) = color.as_mut() {
-                                    let mut rgb = [c.r, c.g, c.b];
-                                    if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                        if rgb != [c.r, c.g, c.b] {
-                                            *c = Color::new(rgb[0], rgb[1], rgb[2]);
-                                            any_edit = true;
-                                        }
+                        {
+                            let colors_ref = &mut self.theme_editing_colors;
+                            egui::ScrollArea::vertical()
+                                .max_height(240.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (i, (label, color)) in colors_ref.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.monospace(*label);
+                                            if let Some(c) = color.as_mut() {
+                                                let mut rgb = [c.r, c.g, c.b];
+                                                if ui.color_edit_button_srgb(&mut rgb).changed()
+                                                    && rgb != [c.r, c.g, c.b]
+                                                {
+                                                    *c = Color::new(rgb[0], rgb[1], rgb[2]);
+                                                    any_edit = true;
+                                                }
+                                            } else {
+                                                // seed with the resolved fallback so an
+                                                // "auto" slot can be given a color again
+                                                let fb = fallbacks[i];
+                                                let mut rgb = [fb.r, fb.g, fb.b];
+                                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                                    *color =
+                                                        Some(Color::new(rgb[0], rgb[1], rgb[2]));
+                                                    any_edit = true;
+                                                }
+                                                ui.weak("auto");
+                                            }
+                                            let unset = ui
+                                                .small_button("\u{00d7}")
+                                                .on_hover_text("unset (automatic fallback)")
+                                                .clicked();
+                                            if unset {
+                                                *color = None;
+                                                any_edit = true;
+                                            }
+                                        });
                                     }
-                                } else {
-                                    let _ = ui.color_edit_button_srgb(&mut [0u8; 3]);
-                                    ui.weak("unset");
-                                }
-                                if ui.small_button("\u{00d7}").clicked() {
-                                    *color = None;
-                                    any_edit = true;
-                                }
-                            });
+                                });
                         }
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             let name = self.theme_editor_name.trim().to_string();
                             if !name.is_empty() && ui.button("Save theme").clicked() {
-                                match save_edited_theme(&name, &self.theme_editing_colors) {
+                                match save_edited_theme(
+                                    &name,
+                                    &self.theme_editing_colors,
+                                    &self.theme.colors,
+                                ) {
                                     Ok(dir) => {
+                                        self.theme_error = None;
                                         eprintln!("theme `{name}` saved to {}", dir.display());
                                         self.cfg.theme = Some(name.clone());
                                         self.reload_theme();
                                         changed = true;
                                     }
-                                    Err(e) => eprintln!("error saving theme `{name}`: {e}"),
+                                    Err(e) => {
+                                        self.theme_error = Some(e.clone());
+                                        eprintln!("error saving theme `{name}`: {e}");
+                                    }
                                 }
                             }
                             if ui.small_button("Reset edits").clicked() {
@@ -576,9 +664,12 @@ impl App {
 }
 
 /// Persist the edited slots as a user theme (shadows built-ins by name).
+/// Missing background/foreground are inherited from the theme being edited so
+/// a saved theme can never render white-on-white.
 fn save_edited_theme(
     name: &str,
     slots: &[(&'static str, Option<Color>)],
+    current: &Colors,
 ) -> Result<std::path::PathBuf, String> {
     if !name
         .chars()
@@ -593,9 +684,18 @@ fn save_edited_theme(
             set_slot(&mut colors, slot, *color);
         }
     }
-    let shade = theme::Shade::from_background(colors.background.unwrap_or(Color::new(255, 255, 255)));
-    let t = theme::Theme::new(name, shade, colors);
-    margdawn_core::importer::save_theme(&t, name)
+    let mut candidate = theme::Theme::new(name, theme::Shade::Dark, colors);
+    let donor = theme::Theme::new("editor", theme::Shade::Dark, current.clone());
+    candidate.inherit_essentials_from(&donor);
+    let bg = candidate.colors.background();
+    let fg = candidate.colors.foreground();
+    if (bg.luma() - fg.luma()).abs() < 32.0 {
+        return Err(
+            "text and background are too similar — the UI would be unreadable".to_string(),
+        );
+    }
+    candidate.appearance = Some(theme::Shade::from_background(bg));
+    margdawn_core::importer::save_theme(&candidate, name)
         .map_err(|e| format!("cannot write theme: {e}"))
 }
 

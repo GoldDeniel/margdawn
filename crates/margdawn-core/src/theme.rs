@@ -226,6 +226,24 @@ impl Theme {
         self.name = Some(name.to_string());
         self
     }
+
+    /// A theme without background/foreground would render invisibly; inherit
+    /// those two slots from `fallback`. Returns true when something was filled.
+    pub fn inherit_essentials_from(&mut self, fallback: &Theme) -> bool {
+        let mut filled = false;
+        if self.colors.background.is_none() {
+            self.colors.background = Some(fallback.colors.background());
+            filled = true;
+        }
+        if self.colors.foreground.is_none() {
+            self.colors.foreground = Some(fallback.colors.foreground());
+            filled = true;
+        }
+        if filled {
+            self.appearance = Some(Shade::from_background(self.colors.background()));
+        }
+        filled
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +271,21 @@ mod tests {
         ] {
             let _ = empty.resolve(k, ColorKey::Foreground);
         }
+    }
+
+    #[test]
+    fn inherits_missing_essentials() {
+        let mut broken: Theme = serde_json::from_str(
+            r##"{ "name": "broken", "appearance": "light", "colors": { "link": "#66D9EF" } }"##,
+        )
+        .unwrap();
+        let fallback = builtin("claude").unwrap();
+        assert!(broken.inherit_essentials_from(&fallback));
+        assert_eq!(broken.colors.background, fallback.colors.background);
+        assert_eq!(broken.colors.foreground, fallback.colors.foreground);
+        assert_eq!(broken.shade(), Shade::Dark);
+        // idempotent
+        assert!(!broken.inherit_essentials_from(&fallback));
     }
 
     #[test]

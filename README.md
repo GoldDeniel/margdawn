@@ -197,8 +197,13 @@ crates/
 ```
 
 ```bash
-cargo test --workspace    # 30 tests
+cargo test --workspace    # 31 tests
 ```
+
+> Fedora/Nobara note: if your editor's rust-analyzer reports bogus errors
+> (e.g. "cannot apply `!` to `bool`") while `cargo build` is clean, it is
+> missing the std sources it analyzes: `sudo dnf install rust-src`, then
+> restart the rust-analyzer server.
 
 Bundled asset licenses: Inter and Source Serif 4 and JetBrains Mono (OFL),
 Noto Emoji images (Apache-2.0), Twemoji flags (CC-BY 4.0); see
