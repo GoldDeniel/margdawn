@@ -2,18 +2,18 @@
 
 A minimal, fast Markdown viewer in Rust — one codebase, two frontends:
 
-| Binary | What it is |
-|---|---|
-| `margdawn` | terminal viewer, renders styled markdown with ANSI colors |
+| Binary         | What it is                                                                 |
+| :------------- | :------------------------------------------------------------------------- |
+| `margdawn`     | terminal viewer, renders styled markdown with ANSI colors                  |
 | `margdawn-gui` | desktop viewer, registers itself as an "Open with…" option for `.md` files |
 
-*Viewer only* — margdawn never edits your files. (Contributions welcome.)
+_Viewer only_ — margdawn never edits your files. (Contributions welcome.)
 
 ## Install
 
-For the user's target platform (Nobara/Fedora).
+For the user's target platform.
 
-### Fedora / Nobara (.rpm)
+### Fedora (.rpm)
 
 ```bash
 cargo install cargo-generate-rpm
@@ -186,8 +186,10 @@ warning: theme `nord` from config.json could not be used (...); falling back to 
   the GUI (toggleable). The terminal renderer always uses a single blank line
   between blocks for a consistent rhythm, like agent CLIs.
 - Terminal output is laid out like glamour/agent CLIs: a 2-column document
-  margin, greedy word wrapping with hanging indents for lists, quotes and
-  footnotes, boxed tables, and optional background panels. `--ascii` (or
+  margin with two blank lines of margin above and below the document, greedy
+  word wrapping with hanging indents for lists, quotes and footnotes, boxed
+  tables, and optional background panels (code panels keep equal left/right
+  margins). `--ascii` (or
   piping) renders the same layout without ANSI styling.
 - Terminal backgrounds are **off by default**, so margdawn blends with your
   terminal's own background: only foreground colors are emitted. Two config
@@ -212,10 +214,10 @@ crates/
 ```
 
 ```bash
-cargo test --workspace    # 42 tests
+cargo test --workspace    # 47 tests
 ```
 
-> Fedora/Nobara note: if your editor's rust-analyzer reports bogus errors
+> Fedora note: if your editor's rust-analyzer reports bogus errors
 > (e.g. "cannot apply `!` to `bool`") while `cargo build` is clean, it is
 > missing the std sources it analyzes: `sudo dnf install rust-src`, then
 > restart the rust-analyzer server.

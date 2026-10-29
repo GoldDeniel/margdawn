@@ -9,7 +9,7 @@ use std::sync::Arc;
 use margdawn_core::md::{Block, CellAlign, Document, Span};
 use margdawn_core::syn;
 use margdawn_core::theme::{Color, ColorKey, Theme};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -425,7 +425,8 @@ impl<'a> Renderer<'a> {
     fn code_block(&self, lang: Option<&str>, text: &str, ctx: &Ctx) -> Vec<Line> {
         let hl = syn::highlight(lang, text, self.code_theme);
         let inner = ctx.with_spaces(CODE_INDENT);
-        let avail = self.width.saturating_sub(inner.col()).max(8);
+        // keep the same margin on the right as the panel's left inset
+        let avail = self.width.saturating_sub(inner.col() * 2).max(8);
         let bg = hl.background;
         let mut lines = Vec::new();
 
@@ -713,6 +714,11 @@ impl<'a> Renderer<'a> {
         while rendered.last().is_some_and(|s| s.trim().is_empty()) {
             rendered.pop();
         }
+        // two lines of margin above and below the document
+        for _ in 0..2 {
+            rendered.insert(0, String::new());
+            rendered.push(String::new());
+        }
         if self.color && self.background {
             let bg = self.bg_seq(self.theme.colors.background());
             for line in &rendered {
@@ -833,6 +839,11 @@ impl<'a> Renderer<'a> {
         out.push_str(&codes);
         out.push_str(&seg.text);
         out.push_str(RESET);
+        if self.background {
+            // re-apply the page background: a plain reset would make the
+            // terminal revert to its own background mid-line
+            out.push_str(&self.bg_seq(self.theme.colors.background()));
+        }
         if osc.is_some() {
             out.push_str(&format!("{OSC8_OPEN}{OSC8_CLOSE}"));
         }
@@ -861,9 +872,13 @@ impl<'a> Renderer<'a> {
 /// Display width of a string that may contain SGR/OSC sequences.
 fn visible_width(s: &str) -> usize {
     let mut width = 0usize;
+    let mut run = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
+            // flush the plain run before skipping the escape
+            width += UnicodeWidthStr::width(run.as_str());
+            run.clear();
             match chars.peek() {
                 Some('[') => {
                     chars.next();
@@ -889,9 +904,9 @@ fn visible_width(s: &str) -> usize {
             }
             continue;
         }
-        width += c.width().unwrap_or(0);
+        run.push(c);
     }
-    width
+    width + UnicodeWidthStr::width(run.as_str())
 }
 
 fn is_external(url: &str) -> bool {
@@ -976,19 +991,16 @@ fn push_word(
 
 fn split_seg(seg: &Seg, max_width: usize) -> Vec<Seg> {
     let mut pieces = Vec::new();
-    let mut text = String::new();
-    let mut width = 0usize;
-    for ch in seg.text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if width + w > max_width && !text.is_empty() {
-            pieces.push(Seg::new(std::mem::take(&mut text), seg.style.clone()));
-            width = 0;
+    let mut start = 0usize;
+    for (idx, ch) in seg.text.char_indices() {
+        let end = idx + ch.len_utf8();
+        if idx > start && UnicodeWidthStr::width(&seg.text[start..end]) > max_width {
+            pieces.push(Seg::new(seg.text[start..idx].to_string(), seg.style.clone()));
+            start = idx;
         }
-        text.push(ch);
-        width += w;
     }
-    if !text.is_empty() {
-        pieces.push(Seg::new(text, seg.style.clone()));
+    if start < seg.text.len() {
+        pieces.push(Seg::new(seg.text[start..].to_string(), seg.style.clone()));
     }
     pieces
 }
@@ -999,27 +1011,32 @@ fn truncate_segs(segs: Vec<Seg>, max: usize) -> (Vec<Seg>, usize) {
     let budget = if truncated { max.saturating_sub(1) } else { max };
     let mut out: Vec<Seg> = Vec::new();
     let mut used = 0usize;
+
     'outer: for seg in segs {
-        let mut text = String::new();
-        for ch in seg.text.chars() {
-            let w = ch.width().unwrap_or(0);
-            if used + w > budget {
-                if !text.is_empty() {
-                    out.push(Seg::new(text, seg.style));
-                }
-                break 'outer;
+        let mut accepted = 0usize; // bytes accepted from this segment
+        for (idx, ch) in seg.text.char_indices() {
+            let end = idx + ch.len_utf8();
+            // measure the candidate prefix as a whole string so emoji
+            // sequences (ZWJ, skin tones, flags, VS16) count correctly
+            let w = used + UnicodeWidthStr::width(&seg.text[..end]);
+            if w > budget {
+                break;
             }
-            text.push(ch);
-            used += w;
+            accepted = end;
         }
-        if !text.is_empty() {
-            out.push(Seg::new(text, seg.style));
+        if accepted > 0 {
+            used += UnicodeWidthStr::width(&seg.text[..accepted]);
+            out.push(Seg::new(seg.text[..accepted].to_string(), seg.style));
+        }
+        if accepted < seg.text.len() {
+            break 'outer;
         }
     }
+
     if truncated {
         out.push(plain("…"));
-        used += 1;
     }
+    // drop trailing spaces, then report the real width for padding
     while let Some(last) = out.last_mut() {
         let trimmed = last.text.trim_end_matches(' ');
         if trimmed.len() == last.text.len() {
@@ -1033,7 +1050,8 @@ fn truncate_segs(segs: Vec<Seg>, max: usize) -> (Vec<Seg>, usize) {
         }
     }
     merge_segs(&mut out);
-    (out, used.min(max))
+    let width = segs_width(&out).min(max);
+    (out, width)
 }
 
 fn strip_task_marker(spans: &[Span]) -> Option<(char, Vec<Span>)> {
@@ -1056,26 +1074,12 @@ mod tests {
     use super::*;
     use margdawn_core::md::parse;
 
-    fn ansi(md: &str, width: usize, background: bool, code_background: bool) -> String {
-        let theme = Arc::new(margdawn_core::theme::builtin("claude").unwrap());
-        let r = Renderer {
-            theme: &theme,
-            code_theme: "monokai",
-            width,
-            color: true,
-            hyperlinks: false,
-            truecolor: true,
-            background,
-            code_background,
-        };
-        let doc = parse(md);
-        let mut s = String::new();
-        r.emit(&r.document(&doc), &mut s);
-        s
+    fn theme() -> Arc<Theme> {
+        Arc::new(margdawn_core::theme::builtin("claude").unwrap())
     }
 
     fn plain(md: &str, width: usize) -> Vec<String> {
-        let theme = Arc::new(margdawn_core::theme::builtin("claude").unwrap());
+        let theme = theme();
         let r = Renderer {
             theme: &theme,
             code_theme: "monokai",
@@ -1092,18 +1096,105 @@ mod tests {
         s.lines().map(String::from).collect()
     }
 
+    fn ansi(md: &str, width: usize, background: bool, code_background: bool) -> String {
+        let theme = theme();
+        let r = Renderer {
+            theme: &theme,
+            code_theme: "monokai",
+            width,
+            color: true,
+            hyperlinks: false,
+            truecolor: true,
+            background,
+            code_background,
+        };
+        let doc = parse(md);
+        let mut s = String::new();
+        r.emit(&r.document(&doc), &mut s);
+        s
+    }
+
+    /// Content lines only (drops the two-line document margins).
+    fn content(md: &str, width: usize) -> Vec<String> {
+        let mut lines = plain(md, width);
+        while lines.first().is_some_and(|l| l.is_empty()) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    fn page_bg() -> String {
+        format!("\x1b[48;2;{}m", margdawn_core::theme::builtin("claude")
+            .unwrap()
+            .colors
+            .background()
+            .to_truecolor())
+    }
+
+    /// Assert every visible character of a line is drawn with the page bg.
+    fn assert_page_bg_everywhere(line: &str, bg: &str) {
+        let mut current_bg: Option<String> = None;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut params = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == 'm' {
+                            break;
+                        }
+                        params.push(ch);
+                    }
+                    if params == "0" || params.is_empty() {
+                        current_bg = None;
+                    } else if params.starts_with("48;2;") || params.starts_with("48;5;") {
+                        current_bg = Some(format!("\x1b[{params}m"));
+                    }
+                } else if chars.peek() == Some(&']') {
+                    // OSC8 hyperlink: skip payload
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            assert!(
+                current_bg.as_deref() == Some(bg),
+                "visible char {c:?} without page background in {line:?}"
+            );
+        }
+    }
+
     #[test]
-    fn one_blank_line_between_blocks_and_margin() {
-        let out = plain("first\n\n\n\nsecond\n", 40);
+    fn two_line_margins_top_and_bottom() {
+        let lines = plain("# hi\n\ntext\n", 40);
+        assert_eq!(&lines[..2], &["", ""], "two blank lines on top");
+        assert_eq!(&lines[lines.len() - 2..], &["", ""], "two blank lines at the bottom");
+        assert_eq!(lines[2], "  # hi");
+    }
+
+    #[test]
+    fn one_blank_line_between_blocks() {
+        let out = content("first\n\n\n\nsecond\n", 40);
         assert_eq!(out, vec!["  first", "", "  second"]);
     }
 
     #[test]
     fn paragraphs_wrap_with_margin() {
         let text = "word ".repeat(40);
-        let out = plain(&text, 30);
-        assert!(out.len() > 1, "should wrap");
-        for line in &out {
+        for line in content(&text, 30) {
+            assert!(!line.is_empty());
             assert!(line.starts_with("  "), "margin missing: {line:?}");
             assert!(UnicodeWidthStr::width(line.as_str()) <= 30, "too wide: {line:?}");
         }
@@ -1111,7 +1202,7 @@ mod tests {
 
     #[test]
     fn list_hanging_indent() {
-        let out = plain("- a fairly long list item that wraps over lines\n", 34);
+        let out = content("- a fairly long list item that wraps over lines\n", 34);
         assert!(out[0].starts_with("  • a"), "{:?}", out[0]);
         assert!(out.len() > 1);
         for cont in &out[1..] {
@@ -1121,7 +1212,7 @@ mod tests {
 
     #[test]
     fn quote_bar_on_every_line() {
-        let out = plain(
+        let out = content(
             "> a quoted paragraph long enough to wrap onto several lines for sure\n>\n> second paragraph\n",
             40,
         );
@@ -1131,12 +1222,15 @@ mod tests {
                 "quote line without bar: {line:?}"
             );
         }
-        assert!(out.iter().any(|l| l == "  │"), "blank line between quote paragraphs should keep the bar");
+        assert!(
+            out.iter().any(|l| l == "  │"),
+            "blank line between quote paragraphs should keep the bar"
+        );
     }
 
     #[test]
     fn ordered_numbers_aligned() {
-        let out = plain("9. nine\n10. ten\n11. eleven\n", 40);
+        let out = content("9. nine\n10. ten\n11. eleven\n", 40);
         assert!(out[0].starts_with("   9. nine"), "{:?}", out[0]);
         assert!(out[1].starts_with("  10. ten"), "{:?}", out[1]);
         assert!(out[2].starts_with("  11. eleven"), "{:?}", out[2]);
@@ -1144,22 +1238,13 @@ mod tests {
 
     #[test]
     fn tables_fit_the_width() {
-        let out = plain(
-            "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n",
-            40,
-        );
+        let out = content("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n", 40);
         for line in &out {
             assert!(line.starts_with("  "), "{line:?}");
             assert!(UnicodeWidthStr::width(line.as_str()) <= 40, "{line:?}");
         }
         assert!(out[0].starts_with("  ┌"));
         assert!(out.last().unwrap().starts_with("  └"));
-    }
-
-    #[test]
-    fn no_trailing_blank_lines() {
-        let out = plain("# hi\n\ntext\n", 40);
-        assert_eq!(out.last().unwrap(), "  text");
     }
 
     #[test]
@@ -1183,7 +1268,10 @@ mod tests {
             true,
         );
         assert!(out.contains("\x1b[48;2;"), "expected code backgrounds");
-        assert!(out.matches("\x1b[48;2;").count() > 1, "inline + block backgrounds");
+        assert!(
+            out.matches("\x1b[48;2;").count() > 1,
+            "inline chip and block panel both need a background"
+        );
     }
 
     #[test]
@@ -1196,5 +1284,91 @@ mod tests {
             assert!(line.starts_with("\x1b[48;2;"), "line lacks page bg: {line:?}");
             assert_eq!(visible_width(line), 30, "line not padded to width: {line:?}");
         }
+    }
+
+    #[test]
+    fn page_background_survives_inline_resets() {
+        let out = ansi(
+            "Some **bold**, *italic*, `code` and a [link](https://example.com) here.\n\n> quoted text\n",
+            48,
+            true,
+            false,
+        );
+        let bg = page_bg();
+        for line in out.lines() {
+            assert_page_bg_everywhere(line, &bg);
+        }
+    }
+
+    #[test]
+    fn code_panel_margins_are_symmetric() {
+        let width = 60;
+        let out = ansi("```rust\nfn main() {}\n```\n", width, false, true);
+        let panel_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("\x1b[48;2;39;40;34m"))
+            .collect();
+        assert!(!panel_lines.is_empty(), "expected monokai panel");
+        for line in panel_lines {
+            // panel starts at margin(2) + code indent(2) = 4 and keeps the
+            // same 4 columns free on the right
+            assert_eq!(visible_width(line), width - 4, "{line:?}");
+        }
+    }
+
+    /// Display-column positions of table border glyphs on a line.
+    fn border_positions(line: &str) -> Vec<usize> {
+        let mut col = 0usize;
+        let mut run = String::new();
+        let mut out = Vec::new();
+        for ch in line.chars() {
+            match ch {
+                '│' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' => {
+                    col += UnicodeWidthStr::width(run.as_str());
+                    run.clear();
+                    out.push(col);
+                    col += 1;
+                }
+                _ => run.push(ch),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn emoji_table_columns_align() {
+        let md = "| a | b | c |\n|:-:|:-:|:-:|\n\
+                  | 😀 | 日本語 | x |\n\
+                  | 👨‍👩‍👧 | 👍🏽 | 🇸🇪 |\n\
+                  | ❤️ | 1️⃣ | a long long long long long cell value |\n";
+        let out = content(md, 64);
+        let positions: Vec<Vec<usize>> = out
+            .iter()
+            .filter(|l| l.contains(['│', '┌', '├', '└']))
+            .map(|l| border_positions(l))
+            .collect();
+        assert!(positions.len() >= 7, "expected full table, got {out:?}");
+        for p in &positions[1..] {
+            assert_eq!(p, &positions[0], "borders drift between rows: {out:?}");
+        }
+    }
+
+    #[test]
+    fn truncation_uses_sequence_widths() {
+        let segs = vec![Seg::new("👨‍👩‍👧", Style::default())];
+        let (out, used) = truncate_segs(segs, 2);
+        assert_eq!(used, 2, "ZWJ family must count as one 2-column glyph");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "👨‍👩‍👧");
+        assert!(!out[0].text.contains('…'));
+    }
+
+    #[test]
+    fn long_ascii_cells_are_truncated_with_ellipsis() {
+        let segs = vec![Seg::new("abcdefghij", Style::default())];
+        let (out, used) = truncate_segs(segs, 6);
+        assert_eq!(used, 6);
+        let text: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, "abcde…");
     }
 }
