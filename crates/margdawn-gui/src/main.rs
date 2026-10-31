@@ -5,6 +5,7 @@
 mod app;
 mod emoji;
 mod fonts;
+mod images;
 mod md_view;
 
 pub use app::c32;

@@ -174,7 +174,11 @@ fn main() {
         }
         println!("built-in themes:");
         for t in &builtin {
-            println!("  {t}");
+            if user.iter().any(|u| u == t) {
+                println!("  {t}  (overridden by user theme)");
+            } else {
+                println!("  {t}");
+            }
         }
         println!("code themes (syntax highlighting):");
         for t in margdawn_core::syn::code_theme_names() {

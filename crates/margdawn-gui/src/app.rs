@@ -10,6 +10,7 @@ use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
 use crate::emoji::EmojiStore;
+use crate::images::ImageStore;
 use crate::md_view::{RenderCfg, View};
 
 pub fn c32(c: Color) -> egui::Color32 {
@@ -32,6 +33,11 @@ pub struct App {
     theme_editing_colors: Vec<(&'static str, Option<Color>)>,
     theme_error: Option<String>,
     emoji: Rc<EmojiStore>,
+    images: Rc<ImageStore>,
+    /// directory of the open document (resolves relative image paths)
+    base_dir: Option<PathBuf>,
+    /// last image width percentage (kept when the force toggle is off)
+    image_pct: f32,
     /// developer hook: `MARGDAWN_SCREENSHOT=out.png` saves a frame and quits
     screenshot: Option<PathBuf>,
     frames: u32,
@@ -59,6 +65,9 @@ impl App {
             theme_editing_colors,
             theme_error: None,
             emoji: Rc::new(EmojiStore::new()),
+            images: Rc::new(ImageStore::new()),
+            base_dir: file.as_ref().and_then(|f| f.parent().map(PathBuf::from)),
+            image_pct: cfg.image_max_width_percent().unwrap_or(80.0),
             screenshot: std::env::var_os("MARGDAWN_SCREENSHOT").map(PathBuf::from),
             frames: 0,
             cfg,
@@ -76,6 +85,7 @@ impl App {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 self.doc = Some(parse(&text));
+                self.base_dir = path.parent().map(PathBuf::from);
                 self.path = Some(path.to_path_buf());
                 self.error = None;
             }
@@ -425,6 +435,8 @@ impl eframe::App for App {
                                     Arc::clone(&self.theme),
                                     RenderCfg::from_config(&self.cfg, &self.theme),
                                     Rc::clone(&self.emoji),
+                                    Rc::clone(&self.images),
+                                    self.base_dir.clone(),
                                 );
                                 view.render_document(ui, doc);
                             });
@@ -463,17 +475,36 @@ impl App {
                 ui.add_space(2.0);
 
                 // ---- theme
-                let mixed: Vec<String> = user_themes
-                    .iter()
-                    .cloned()
-                    .chain(builtin_themes.iter().map(|s| s.to_string()))
-                    .collect();
+                // de-duplicate: user themes shadow built-ins, and must not
+                // appear twice in the picker
+                let mut mixed: Vec<String> = Vec::new();
+                for name in &user_themes {
+                    if !mixed.contains(name) {
+                        mixed.push(name.clone());
+                    }
+                }
+                for name in &builtin_themes {
+                    if !mixed.iter().any(|m| m == name) {
+                        mixed.push((*name).to_string());
+                    }
+                }
+                let is_shadowed = |name: &str| {
+                    user_themes.iter().any(|u| u == name)
+                        && builtin_themes.iter().any(|b| *b == name)
+                };
+                let label_for = |name: &str| {
+                    if is_shadowed(name) {
+                        format!("{name}  (custom, overrides built-in)")
+                    } else {
+                        name.to_string()
+                    }
+                };
                 let mut sel = self.cfg.theme_name().to_string();
                 egui::ComboBox::from_label("Theme")
-                    .selected_text(sel.clone())
+                    .selected_text(label_for(&sel))
                     .show_ui(ui, |ui| {
                         for t in &mixed {
-                            ui.selectable_value(&mut sel, t.clone(), t);
+                            ui.selectable_value(&mut sel, t.clone(), label_for(t));
                         }
                     });
                 if sel != self.cfg.theme_name() {
@@ -554,6 +585,34 @@ impl App {
                     changed = true;
                 }
 
+                // ---- images
+                ui.add_space(8.0);
+                ui.heading("Images");
+                ui.add_space(2.0);
+                let mut forced = self.cfg.image_max_width_percent.is_some();
+                if ui
+                    .checkbox(&mut forced, "Force maximum image width")
+                    .changed()
+                {
+                    self.cfg.image_max_width_percent =
+                        forced.then_some(self.image_pct.clamp(5.0, 100.0));
+                    changed = true;
+                }
+                let mut pct = self.cfg.image_max_width_percent.unwrap_or(self.image_pct);
+                let resp = ui.add_enabled(
+                    forced,
+                    egui::Slider::new(&mut pct, 10.0..=100.0)
+                        .suffix("%")
+                        .text("Max width (share of content)"),
+                );
+                if resp.changed() {
+                    self.image_pct = pct;
+                    if forced {
+                        self.cfg.image_max_width_percent = Some(pct);
+                    }
+                    changed = true;
+                }
+
                 // ---- theme editor
                 ui.add_space(10.0);
                 let open_editor = std::env::var("MARGDAWN_SETTINGS")
@@ -566,6 +625,17 @@ impl App {
                             ui.label("Name:");
                             ui.text_edit_singleline(&mut self.theme_editor_name);
                         });
+                        let name = self.theme_editor_name.trim().to_string();
+                        if !name.is_empty()
+                            && builtin_themes.iter().any(|b| *b == name)
+                        {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 150, 60),
+                                format!("overrides the built-in theme `{name}`"),
+                            );
+                        } else if !name.is_empty() && user_themes.iter().any(|u| *u == name) {
+                            ui.weak(format!("overwrites your existing theme `{name}`"));
+                        }
                         ui.add_space(2.0);
                         ui.weak("(unset slots fall back automatically)");
                         if let Some(err) = &self.theme_error {

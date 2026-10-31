@@ -281,6 +281,7 @@ impl<'a> Renderer<'a> {
                             code: false,
                             link: None,
                             color: ColorKey::Heading,
+                            image: None,
                         },
                     );
                     self.wrap(&spans, ctx, ColorKey::Heading, muted, true)
@@ -307,6 +308,25 @@ impl<'a> Renderer<'a> {
             }
             Block::List { ordered, start, items } => {
                 self.list(*ordered, *start, items, ctx, muted)
+            }
+            Block::Image(img) => {
+                // terminals can't show pictures: render the alt text as a link
+                let label = if img.alt.is_empty() { &img.src } else { &img.alt };
+                let mut text = format!("\u{1F5BC} {label}");
+                if !self.hyperlinks && label.as_str() != img.src {
+                    text.push_str(&format!(" ({})", img.src));
+                }
+                let span = Span {
+                    text,
+                    bold: false,
+                    italic: false,
+                    strike: false,
+                    code: false,
+                    link: Some(img.src.clone()),
+                    color: ColorKey::Link,
+                    image: None,
+                };
+                self.wrap(std::slice::from_ref(&span), ctx, ColorKey::Foreground, muted, false)
             }
             Block::Table { align, header, rows } => self.table(align, header, rows, ctx),
             Block::Rule => self.rule(ctx),

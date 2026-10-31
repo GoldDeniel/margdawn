@@ -48,6 +48,10 @@ pub struct Config {
     /// Default: false (keep only foreground colors).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_background: Option<bool>,
+    /// GUI: force a maximum image width as a percentage of the content width.
+    /// Unset = images use their natural size (capped to the available width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_max_width_percent: Option<f32>,
 }
 
 pub const DEFAULT_FONT_SIZE: f32 = 15.0;
@@ -106,6 +110,11 @@ impl Config {
     /// Terminal: paint code-block and inline-code backgrounds (default off).
     pub fn code_background_enabled(&self) -> bool {
         self.code_background.unwrap_or(false)
+    }
+
+    /// GUI: forced max image width percentage, if enabled.
+    pub fn image_max_width_percent(&self) -> Option<f32> {
+        self.image_max_width_percent.map(|p| p.clamp(5.0, 100.0))
     }
 }
 

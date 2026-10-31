@@ -11,6 +11,7 @@ margdawn-core = { path = "../margdawn-core" }
 eframe = { workspace = true }
 rfd = { workspace = true }
 png = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [package.metadata.generate-rpm]
 license = "MIT"

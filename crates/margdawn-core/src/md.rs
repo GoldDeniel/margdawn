@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::ColorKey;
 
+/// An image reference (`![alt](src)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub src: String,
+    #[serde(default)]
+    pub alt: String,
+}
+
 /// One inline run. `color` is the palette slot; flags modify style.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
@@ -26,6 +34,8 @@ pub struct Span {
     pub link: Option<String>,
     #[serde(default)]
     pub color: ColorKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageRef>,
 }
 
 /// Optional span-level background (used for inline code chips).
@@ -40,6 +50,8 @@ pub enum Block {
     Quote(u8, Vec<Block>),
     List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
     Table { align: Vec<CellAlign>, header: Vec<Vec<Span>>, rows: Vec<Vec<Vec<Span>>> },
+    /// A paragraph that consists of a single image.
+    Image(ImageRef),
     Rule,
     FootnoteDef { label: String, blocks: Vec<Block> },
 }
@@ -131,6 +143,7 @@ impl Inline {
             code: false,
             link: st.link.clone(),
             color: st.color,
+            image: None,
         });
     }
 
@@ -175,6 +188,8 @@ struct Builder<'src> {
     code_lang: Option<String>,
     /// color to restore when a link closes
     link_prev_color: Option<ColorKey>,
+    /// image currently being collected (alt text arrives as text events)
+    pending_image: Option<ImageRef>,
     table: Option<TableState>,
     /// Byte offset where the last piece of inline content ended; gaps between
     /// blocks are measured from here to the start of the next block.
@@ -207,6 +222,7 @@ impl<'src> Builder<'src> {
             code_text: None,
             code_lang: None,
             link_prev_color: None,
+            pending_image: None,
             table: None,
             last_content_end: 0,
             next_gap: 0,
@@ -232,6 +248,8 @@ impl<'src> Builder<'src> {
             Event::Text(t) => {
                 if let Some(buf) = &mut self.code_text {
                     buf.push_str(&t);
+                } else if let Some(img) = &mut self.pending_image {
+                    img.alt.push_str(&t);
                 } else {
                     self.inline.push(&t, &self.style);
                 }
@@ -239,16 +257,28 @@ impl<'src> Builder<'src> {
             }
             Event::Code(t) => {
                 self.last_content_end = range.end;
-                self.push_code_span(&t);
+                if let Some(img) = &mut self.pending_image {
+                    img.alt.push_str(&t);
+                } else {
+                    self.push_code_span(&t);
+                }
             }
             Event::SoftBreak => {
                 if let Some(buf) = &mut self.code_text {
                     buf.push('\n');
+                } else if let Some(img) = &mut self.pending_image {
+                    img.alt.push(' ');
                 } else {
                     self.inline.push("\n", &self.style);
                 }
             }
-            Event::HardBreak => self.inline.push("\n", &self.style),
+            Event::HardBreak => {
+                if let Some(img) = &mut self.pending_image {
+                    img.alt.push(' ');
+                } else {
+                    self.inline.push("\n", &self.style);
+                }
+            }
             Event::Rule => {
                 self.flush_inline();
                 self.next_gap = count_blanks(self.src, self.last_content_end, range.start);
@@ -353,8 +383,10 @@ impl<'src> Builder<'src> {
                 self.inline.take();
             }
             Tag::Image { dest_url, .. } => {
-                self.inline.push("\u{1F5BC} ", &self.style);
-                self.style.link = Some(dest_url.to_string());
+                self.pending_image = Some(ImageRef {
+                    src: dest_url.to_string(),
+                    alt: String::new(),
+                });
             }
             Tag::HtmlBlock | Tag::MetadataBlock(_) => {}
         }
@@ -378,7 +410,28 @@ impl<'src> Builder<'src> {
                     self.style.color = c;
                 }
             }
-            TagEnd::Image => self.style.link = None,
+            TagEnd::Image => {
+                let img = self.pending_image.take().unwrap_or(ImageRef {
+                    src: String::new(),
+                    alt: String::new(),
+                });
+                let label = if img.alt.is_empty() {
+                    img.src.clone()
+                } else {
+                    img.alt.clone()
+                };
+                let link = self.style.link.clone().or_else(|| Some(img.src.clone()));
+                self.inline.0.push(Span {
+                    text: if label.is_empty() { "image".to_string() } else { label },
+                    bold: false,
+                    italic: false,
+                    strike: false,
+                    code: false,
+                    link,
+                    color: ColorKey::Link,
+                    image: Some(img),
+                });
+            }
             TagEnd::CodeBlock => {
                 if let Some(text) = self.code_text.take() {
                     let lang = self.code_lang.take();
@@ -463,6 +516,7 @@ impl<'src> Builder<'src> {
             code: true,
             link: st.link.clone(),
             color: ColorKey::Code,
+            image: None,
         });
     }
 
@@ -472,11 +526,14 @@ impl<'src> Builder<'src> {
         if spans.is_empty() {
             return;
         }
+        let block = lone_image(&spans)
+            .map(Block::Image)
+            .unwrap_or(Block::Paragraph(spans));
         // Inside a container the pending paragraph belongs to that container
         // and carries no gap; gaps only apply at the top level.
         if let Some(open) = self.stack.last_mut() {
             if let Some(buf) = open.blocks_mut() {
-                buf.push(Block::Paragraph(spans));
+                buf.push(block);
                 return;
             }
         }
@@ -484,7 +541,7 @@ impl<'src> Builder<'src> {
             // table cells flush via End(TableCell)
             return;
         }
-        self.push_top(Block::Paragraph(spans));
+        self.push_top(block);
     }
 
     /// Push a completed block: into innermost open container when nested,
@@ -503,6 +560,22 @@ impl<'src> Builder<'src> {
             block,
         });
     }
+}
+
+/// If the spans are just one image (plus whitespace), return that image.
+fn lone_image(spans: &[Span]) -> Option<ImageRef> {
+    let mut image = None;
+    for span in spans {
+        if let Some(img) = &span.image {
+            if image.is_some() {
+                return None;
+            }
+            image = Some(img.clone());
+        } else if !span.text.trim().is_empty() {
+            return None;
+        }
+    }
+    image
 }
 
 fn level_to_u8(level: HeadingLevel) -> u8 {
@@ -531,6 +604,7 @@ mod tests {
                 Block::CodeBlock { .. } => "code",
                 Block::Rule => "rule",
                 Block::Table { .. } => "table",
+                Block::Image(..) => "img",
                 Block::FootnoteDef { .. } => "fn",
             })
             .collect()
@@ -662,6 +736,53 @@ mod tests {
                 assert_eq!(items.len(), 2);
             }
             other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standalone_image_becomes_image_block() {
+        let doc = parse("![a cat](images/cat.png)");
+        assert_eq!(kinds(&doc), vec!["img"]);
+        match &doc.blocks[0].block {
+            Block::Image(img) => {
+                assert_eq!(img.src, "images/cat.png");
+                assert_eq!(img.alt, "a cat");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_image_stays_in_paragraph() {
+        let doc = parse("before ![a cat](cat.png) after");
+        match &doc.blocks[0].block {
+            Block::Paragraph(spans) => {
+                let img = spans.iter().find_map(|s| s.image.clone()).expect("image span");
+                assert_eq!(img.src, "cat.png");
+                assert!(spans.iter().any(|s| s.text.contains("before")));
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linked_image_is_still_an_image_block() {
+        let doc = parse("[![badge](b.png)](https://example.com)");
+        match &doc.blocks[0].block {
+            Block::Image(img) => assert_eq!(img.src, "b.png"),
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_without_alt_uses_source_as_label() {
+        let doc = parse("![](pic.png)");
+        match &doc.blocks[0].block {
+            Block::Image(img) => {
+                assert_eq!(img.src, "pic.png");
+                assert_eq!(img.alt, "");
+            }
+            other => panic!("expected image block, got {other:?}"),
         }
     }
 }

@@ -85,7 +85,8 @@ is set in `~/.config/margdawn/config.json`:
   "font_heading": "serif",
   "font_mono": "jetbrainsmono",
   "background": false,
-  "code_background": false
+  "code_background": false,
+  "image_max_width_percent": null
 }
 ```
 
@@ -201,6 +202,17 @@ warning: theme `nord` from config.json could not be used (...); falling back to 
     terminal width.
   - `"code_background": true` — paint code-block panels and inline-code chips
     (works with or without the document background).
+- **Images** are displayed in the GUI: local paths resolve relative to the
+  markdown file (absolute paths and `file://` also work; images are cached and
+  reloaded when they change). Remote URLs are intentionally not fetched and
+  show a placeholder. In Settings → Images you can tick **Force maximum image
+  width** and pick a percentage of the content width (config key
+  `image_max_width_percent`; unset = natural size, capped to the window).
+  The terminal shows an `🖼 alt text` placeholder instead.
+- **Theme name conflicts**: a user theme that shares a name with a built-in
+  shadows it deliberately — the picker lists it once, labelled
+  `(custom, overrides built-in)`, the theme editor warns before saving, and
+  `margdawn --list-themes` marks the shadowed built-in.
 - **Color emoji** render inline in the GUI: Noto Emoji PNGs (Apache-2.0) are
   bundled, with Twemoji (CC-BY 4.0) covering national flags, which Noto does
   not ship. Emoji in the terminal use your terminal font.
@@ -216,7 +228,7 @@ crates/
 ```
 
 ```bash
-cargo test --workspace    # 47 tests
+cargo test --workspace    # 53 tests
 ```
 
 > Fedora note: if your editor's rust-analyzer reports bogus errors

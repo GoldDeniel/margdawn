@@ -19,6 +19,7 @@ use margdawn_core::theme::{Color, ColorKey, Theme};
 use crate::c32;
 use crate::emoji::{self, EmojiStore, Piece};
 use crate::fonts::{self, Face};
+use crate::images::ImageStore;
 
 /// Rendering knobs (sourced from config + active theme).
 #[derive(Debug, Clone)]
@@ -30,6 +31,8 @@ pub struct RenderCfg {
     pub code_theme: String,
     pub body: Face,
     pub heading: Face,
+    /// forced max image width, as a percentage of the content width
+    pub image_max_width_percent: Option<f32>,
 }
 
 impl RenderCfg {
@@ -48,6 +51,7 @@ impl RenderCfg {
             code_theme: cfg.code_theme_name().to_string(),
             body,
             heading,
+            image_max_width_percent: cfg.image_max_width_percent(),
         }
     }
 }
@@ -72,12 +76,21 @@ pub struct View {
     pub theme: Arc<Theme>,
     cfg: RenderCfg,
     emoji: Rc<EmojiStore>,
+    images: Rc<ImageStore>,
+    /// directory of the open document, for resolving relative image paths
+    base_dir: Option<std::path::PathBuf>,
     widget_id: u64,
 }
 
 impl View {
-    pub fn new(theme: Arc<Theme>, cfg: RenderCfg, emoji: Rc<EmojiStore>) -> Self {
-        Self { theme, cfg, emoji, widget_id: 0 }
+    pub fn new(
+        theme: Arc<Theme>,
+        cfg: RenderCfg,
+        emoji: Rc<EmojiStore>,
+        images: Rc<ImageStore>,
+        base_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self { theme, cfg, emoji, images, base_dir, widget_id: 0 }
     }
 
     // ---- document / spacing -------------------------------------------------
@@ -430,6 +443,7 @@ impl View {
             }
             Block::List { ordered, start, items } => self.render_list(ui, *ordered, *start, items),
             Block::Table { align, header, rows } => self.render_table(ui, align, header, rows),
+            Block::Image(image) => self.render_image(ui, image),
             Block::Rule => {
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 2.0),
@@ -457,6 +471,53 @@ impl View {
             }
         }
         let _ = ps;
+    }
+
+    fn render_image(&mut self, ui: &mut egui::Ui, image: &margdawn_core::md::ImageRef) {
+        let alt = if image.alt.is_empty() { &image.src } else { &image.alt };
+        match self.images.texture(ui.ctx(), self.base_dir.as_deref(), &image.src) {
+            Some((texture, pixel_size)) => {
+                let ppp = ui.ctx().pixels_per_point();
+                let natural = pixel_size / ppp;
+                let avail = ui.available_width();
+                let mut width = natural.x.min(avail);
+                if let Some(pct) = self.cfg.image_max_width_percent {
+                    width = width.min(avail * pct / 100.0);
+                }
+                let scale = if natural.x > 0.0 { width / natural.x } else { 1.0 };
+                let size = egui::vec2(width, (natural.y * scale).max(1.0));
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(avail, size.y), egui::Sense::hover());
+                let image_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + (avail - size.x) / 2.0, rect.top()),
+                    size,
+                );
+                ui.painter().image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                ui.add_space(2.0);
+            }
+            None => {
+                let muted = c32(self.theme.colors.resolve(ColorKey::Muted, ColorKey::Foreground));
+                let remote = image.src.starts_with("http://")
+                    || image.src.starts_with("https://")
+                    || image.src.starts_with("data:");
+                let note = if remote {
+                    "remote images are not supported"
+                } else {
+                    "image not found"
+                };
+                ui.label(
+                    egui::RichText::new(format!("[image: {alt}] ({note})"))
+                        .color(muted)
+                        .italics(),
+                );
+            }
+        }
     }
 
     fn render_code_block(&mut self, ui: &mut egui::Ui, lang: Option<&str>, text: &str) {
