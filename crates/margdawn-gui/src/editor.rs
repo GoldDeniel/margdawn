@@ -15,9 +15,11 @@
 //!    opaque by design: a `*` or `_` between dollars is a character, not
 //!    emphasis.
 
+use std::sync::Arc;
+
 use eframe::egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
-    Color32, FontId,
+    Color32, FontId, Galley, Response, ScrollArea, TextBuffer, TextEdit,
 };
 
 /// Colours and type scale for the editor, resolved from the active theme.
@@ -152,6 +154,57 @@ pub fn highlight(src: &str, st: &SyntaxStyle, wrap_width: f32) -> LayoutJob {
 
 fn marker_char(m: [u8; 3]) -> char {
     m[0] as char
+}
+
+/// What the editable pane produced in one frame.
+#[derive(Debug)]
+pub struct EditorOutput {
+    /// the underlying `TextEdit` (`.changed()`, `.id`, focus)
+    pub response: Response,
+    /// vertical scroll offset the pane sits at this frame (0.0 = top).
+    /// Read by the scroll regression tests, which is why it is not private.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub scroll_offset: f32,
+}
+
+/// The editable source pane: `text` styled by `highlight`, in a vertical
+/// scroll area at least `min_rows` rows tall.
+///
+/// The scroll area is load-bearing, not decoration. `TextEdit` has no
+/// scrolling of its own — it sizes itself to the whole galley — and egui only
+/// pans to the caret when a parent `ScrollArea` exists (`TextEdit` calls
+/// `ui.scroll_to_rect` on every edit). Dropped straight into a panel, a
+/// document taller than the window cannot be scrolled at all: everything past
+/// the panel is clipped away, and the caret is freely paintable outside the
+/// visible rect. `min_rows` fills the viewport so clicking the blank space
+/// under a short document still puts the caret at the end.
+pub fn source_editor(
+    ui: &mut eframe::egui::Ui,
+    text: &mut dyn TextBuffer,
+    st: &SyntaxStyle,
+    min_rows: usize,
+) -> EditorOutput {
+    let mut layouter = |ui: &eframe::egui::Ui, text: &str, wrap_width: f32| -> Arc<Galley> {
+        let job = highlight(text, st, wrap_width);
+        ui.fonts(|f| f.layout_job(job))
+    };
+
+    let edit = TextEdit::multiline(text)
+        .font(st.font.clone())
+        .desired_width(f32::INFINITY)
+        .desired_rows(min_rows.max(1))
+        .frame(false)
+        .margin(eframe::egui::Margin::same(0.0))
+        .lock_focus(true)
+        .layouter(&mut layouter);
+
+    let out = ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| ui.add(edit));
+    EditorOutput {
+        response: out.inner,
+        scroll_offset: out.state.offset.y,
+    }
 }
 
 /// Write `text` to `path` without ever leaving a half-written file behind.
@@ -563,6 +616,167 @@ mod tests {
     fn empty_fence_does_not_panic() {
         let job = styled("```\n");
         assert_eq!(job.text, "```\n");
+    }
+
+    // ---- the pane must scroll ----------------------------------------------
+
+    /// One real egui frame with the editor pane in a full-window panel.
+    fn pane_frame(
+        ctx: &eframe::egui::Context,
+        input: eframe::egui::RawInput,
+        text: &mut String,
+        st: &SyntaxStyle,
+    ) -> (eframe::egui::Id, f32) {
+        use eframe::egui;
+        let mut got = None;
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let row_h = ui.fonts(|f| f.row_height(&st.font));
+                let rows = ((ui.available_height() / row_h).ceil() as usize).max(1);
+                let out = source_editor(ui, text, st, rows);
+                got = Some((out.response.id, out.scroll_offset));
+            });
+        });
+        got.expect("the editor pane should have been shown")
+    }
+
+    /// Run `events` on the first frame, then idle frames — scroll animations
+    /// need a while to settle. Returns the pane's id and final scroll offset.
+    fn pane_run(
+        ctx: &eframe::egui::Context,
+        events: Vec<eframe::egui::Event>,
+        frames: usize,
+        text: &mut String,
+        st: &SyntaxStyle,
+    ) -> (eframe::egui::Id, f32) {
+        use eframe::egui;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 220.0));
+        let mut got = (egui::Id::NULL, 0.0);
+        for i in 0..frames.max(1) {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: if i == 0 { events.clone() } else { Vec::new() },
+                ..Default::default()
+            };
+            got = pane_frame(ctx, input, text, st);
+        }
+        got
+    }
+
+    /// Click at `pos`: press on one frame, release on the next. This is what a
+    /// real pointer does, and what gives the editor focus plus a caret.
+    fn pane_click(
+        ctx: &eframe::egui::Context,
+        pos: eframe::egui::Pos2,
+        text: &mut String,
+        st: &SyntaxStyle,
+    ) -> (eframe::egui::Id, f32) {
+        use eframe::egui;
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut got = (egui::Id::NULL, 0.0);
+        for ev in [button(true), button(false)] {
+            got = pane_run(ctx, vec![egui::Event::PointerMoved(pos), ev], 2, text, st);
+        }
+        got
+    }
+
+    /// The bug this guards: the pane used to be a bare `TextEdit` sized to the
+    /// window, so everything past the window was clipped away with no way to
+    /// reach it, and the caret could be drawn outside the visible rect.
+    #[test]
+    fn a_long_document_scrolls_and_the_caret_stays_in_view() {
+        use eframe::egui;
+
+        let ctx = egui::Context::default();
+        let st = style();
+        let mut text: String = (0..300)
+            .map(|i| format!("line {i:03} of a document much taller than the window\n"))
+            .collect();
+
+        // a fresh pane sits at the top
+        let (_, offset) = pane_run(&ctx, Vec::new(), 2, &mut text, &st);
+        assert_eq!(offset, 0.0, "a fresh pane should start at the top");
+
+        // wheel down over the pane: the "I can't scroll" move
+        let wheel = vec![
+            egui::Event::PointerMoved(egui::pos2(200.0, 100.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let (_, after_wheel) = pane_run(&ctx, wheel, 10, &mut text, &st);
+        assert!(
+            after_wheel > 0.0,
+            "the wheel did not move the pane: offset = {after_wheel}"
+        );
+
+        // click into the text so the editor has focus and a caret
+        let (id, _) = pane_click(&ctx, egui::pos2(60.0, 60.0), &mut text, &st);
+        assert!(
+            ctx.memory(|m| m.has_focus(id)),
+            "the click did not focus the pane"
+        );
+
+        // Ctrl+End moves the caret to the last line: the pane has to pan down
+        // after it instead of letting the caret sink out of the window
+        let key = vec![egui::Event::Key {
+            key: egui::Key::End,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }];
+        let (_, at_end) = pane_run(&ctx, key, 60, &mut text, &st);
+        assert!(
+            at_end > 3000.0,
+            "the pane did not follow the caret to the end: offset = {at_end}"
+        );
+    }
+
+    /// A short document still gets a full-height pane, so clicking the empty
+    /// space below the text lands the caret at the end instead of nowhere.
+    #[test]
+    fn a_short_document_still_fills_the_viewport() {
+        use eframe::egui;
+
+        let ctx = egui::Context::default();
+        let st = style();
+        let mut text = "# tiny\n".to_string();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 220.0));
+
+        // two frames: fonts only exist once `Context::run` has seen a frame
+        let mut bottom = 0.0;
+        let mut panel_bottom = 0.0;
+        let mut row_h = 0.0;
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    panel_bottom = ui.available_rect_before_wrap().bottom();
+                    row_h = ui.fonts(|f| f.row_height(&st.font));
+                    let rows = ((ui.available_height() / row_h).ceil() as usize).max(1);
+                    let out = source_editor(ui, &mut text, &st, rows);
+                    bottom = out.response.rect.bottom();
+                });
+            });
+        }
+        // the pane covers every row that fits: the leftover must be less than
+        // one more row of empty background
+        assert!(
+            panel_bottom - bottom < row_h,
+            "pane bottom {bottom} left {} of dead space below it (one row is {row_h})",
+            panel_bottom - bottom
+        );
     }
 
     // ---- writing back ------------------------------------------------------
