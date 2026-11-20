@@ -9,7 +9,8 @@ A minimal, fast Markdown viewer in Rust — one codebase, two frontends:
 | `margdawn`     | terminal viewer, renders styled markdown with ANSI colors                  |
 | `margdawn-gui` | desktop viewer, registers itself as an "Open with…" option for `.md` files |
 
-_Viewer only_ — margdawn never edits your files. (Contributions welcome.)
+_Mostly a viewer._ margdawn opens files read-only; the GUI can also edit one in
+place — see [Editing](#editing). (Contributions welcome.)
 
 ## Install
 
@@ -66,6 +67,30 @@ margdawn-gui file.md            # view in GUI
 ```
 
 GUI extras: `Ctrl+O` opens a file, drag & drop works, Reload button re-reads.
+
+## Editing
+
+The GUI edits files in place. It is still a viewer by default — nothing is
+written until you ask.
+
+- **Edit** (`Ctrl+E`) switches the content pane to the source with its markup
+  shown: `#`, `**`, backticks, list dashes and fences stay visible but dimmed,
+  headings stay large, and bold/italic/code keep their styling. Cursor,
+  selection and undo work on the real bytes, so what you see is what gets
+  saved.
+- **Save** (`Ctrl+S`) writes the buffer. Unsaved work is marked with a `•` next
+  to the filename and in the window title.
+- **Done** / `Esc` returns to the rendered view. If the buffer is dirty it asks
+  first — Save, Discard or Cancel — and the same guard covers Reload, Open and
+  drag & drop.
+- Writes are atomic: a temp file in the same directory is renamed over the
+  target, and the original permission bits and symlinks are respected.
+
+Two things are deliberately never reformatted:
+
+- **fenced code blocks** — everything between the fences is opaque text;
+- **math** — `$…$` and `$$…$$` stay exactly as typed, so `$a * b$` does not
+  become emphasis. An unmatched `$` is just a dollar sign.
 
 ## Themes
 
