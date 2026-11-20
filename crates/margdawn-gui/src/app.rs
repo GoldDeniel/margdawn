@@ -10,7 +10,7 @@ use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
 use crate::emoji::EmojiStore;
-use crate::editor::{highlight, save_text, SyntaxStyle};
+use crate::editor::{save_text, SyntaxStyle};
 use crate::images::ImageStore;
 use crate::md_view::{RenderCfg, View};
 
@@ -679,25 +679,13 @@ impl App {
             return;
         };
 
-        let mut layouter =
-            |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
-                let job = highlight(text, &st, wrap_width);
-                ui.fonts(|f| f.layout_job(job))
-            };
+        // Fill the window with the pane so the source has somewhere to be, then
+        // let it grow past the viewport when the document is longer.
+        let row_height = ui.fonts(|f| f.row_height(&st.font));
+        let min_rows = ((ui.available_height() / row_height).ceil() as usize).max(1);
 
-        let edit = egui::TextEdit::multiline(src)
-            .desired_width(f32::INFINITY)
-            .desired_rows(24)
-            .frame(false)
-            .margin(egui::Margin::same(0.0))
-            .lock_focus(true)
-            .layouter(&mut layouter);
-
-        let resp = ui.add_sized(
-            [ui.available_width(), ui.available_height()],
-            edit,
-        );
-        if resp.changed() {
+        let out = crate::editor::source_editor(ui, src, &st, min_rows);
+        if out.response.changed() {
             self.file_dirty = true;
         }
     }
