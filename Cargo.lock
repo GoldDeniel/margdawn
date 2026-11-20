@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "margdawn-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "margdawn-core",
  "terminal_size",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "margdawn-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dirs",
  "pulldown-cmark",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "margdawn-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "image",
