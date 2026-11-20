@@ -10,8 +10,17 @@ use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
 use crate::emoji::EmojiStore;
+use crate::editor::{highlight, save_text, SyntaxStyle};
 use crate::images::ImageStore;
 use crate::md_view::{RenderCfg, View};
+
+/// An action held back because the buffer has unsaved changes.
+#[derive(Debug, Clone)]
+enum PendingAction {
+    LeaveEdit,
+    Reload,
+    Open(PathBuf),
+}
 
 pub fn c32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
@@ -41,6 +50,21 @@ pub struct App {
     /// developer hook: `MARGDAWN_SCREENSHOT=out.png` saves a frame and quits
     screenshot: Option<PathBuf>,
     frames: u32,
+    /// raw source of the open file. The parsed `Document` has already dropped
+    /// the markup, so this is the only copy of what is actually on disk.
+    src: Option<String>,
+    /// edit mode: the content pane shows the source with dimmed markup
+    editing: bool,
+    /// the buffer differs from what is on disk
+    file_dirty: bool,
+    /// an action waiting for Save / Discard / Cancel
+    confirm: Option<PendingAction>,
+    /// last write error, shown above the editor
+    save_error: Option<String>,
+    /// where the view was scrolled to, so a round trip through edit mode
+    /// doesn't throw the reader back to the top
+    view_offset: f32,
+    restore_offset: Option<f32>,
 }
 
 impl App {
@@ -70,6 +94,13 @@ impl App {
             image_pct: cfg.image_max_width_percent().unwrap_or(80.0),
             screenshot: std::env::var_os("MARGDAWN_SCREENSHOT").map(PathBuf::from),
             frames: 0,
+            src: None,
+            editing: false,
+            file_dirty: false,
+            confirm: None,
+            save_error: None,
+            view_offset: 0.0,
+            restore_offset: None,
             cfg,
         };
         if std::env::var_os("MARGDAWN_SETTINGS").is_some() {
@@ -78,6 +109,17 @@ impl App {
         if let Some(f) = file {
             app.load_file(&f);
         }
+        // dev hook, mirrors MARGDAWN_SETTINGS: start already in edit mode so a
+        // screenshot run can capture it without a click
+        if std::env::var_os("MARGDAWN_EDIT").is_some() && app.src.is_some() {
+            app.editing = true;
+        }
+        // and one for the unsaved-changes state: dirty buffer + open dialog
+        if std::env::var_os("MARGDAWN_DIRTY").is_some() && app.src.is_some() {
+            app.editing = true;
+            app.file_dirty = true;
+            app.confirm = Some(PendingAction::LeaveEdit);
+        }
         app
     }
 
@@ -85,15 +127,110 @@ impl App {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 self.doc = Some(parse(&text));
+                self.src = Some(text);
                 self.base_dir = path.parent().map(PathBuf::from);
                 self.path = Some(path.to_path_buf());
                 self.error = None;
+                self.save_error = None;
+                self.file_dirty = false;
+                self.confirm = None;
             }
             Err(e) => {
                 self.error = Some(format!("cannot read {}: {e}", path.display()));
                 self.doc = None;
+                self.src = None;
+                self.file_dirty = false;
             }
         }
+    }
+
+    /// Write the buffer back to disk. Does nothing without a path.
+    fn save_file(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        let Some(src) = self.src.clone() else { return };
+        match save_text(&path, &src) {
+            Ok(()) => {
+                self.file_dirty = false;
+                self.save_error = None;
+                self.error = None;
+                // keep the view honest: it renders whatever is now on disk
+                self.doc = Some(parse(&src));
+            }
+            Err(e) => {
+                self.save_error = Some(format!("cannot write {}: {e}", path.display()));
+            }
+        }
+    }
+
+    /// Toggle edit mode, holding the change back if the buffer is dirty.
+    fn toggle_edit(&mut self) {
+        if self.editing {
+            if self.file_dirty {
+                self.confirm = Some(PendingAction::LeaveEdit);
+            } else {
+                self.editing = false;
+                self.reparse();
+            }
+        } else if self.src.is_some() {
+            self.editing = true;
+            self.save_error = None;
+        }
+    }
+
+    /// Re-render the view from the buffer (used when leaving edit mode).
+    fn reparse(&mut self) {
+        if let Some(src) = &self.src {
+            self.doc = Some(parse(src));
+        }
+        // the reader was somewhere in this document a moment ago
+        self.restore_offset = Some(self.view_offset);
+    }
+
+    /// Open a file, asking first if the buffer would be thrown away.
+    fn request_open(&mut self, path: PathBuf) {
+        if self.editing && self.file_dirty {
+            self.confirm = Some(PendingAction::Open(path));
+        } else {
+            self.load_file(&path);
+        }
+    }
+
+    /// Reload from disk, asking first if the buffer would be thrown away.
+    fn request_reload(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        if self.editing && self.file_dirty {
+            self.confirm = Some(PendingAction::Reload);
+        } else {
+            self.load_file(&path);
+        }
+    }
+
+    /// Discard the buffer and reload from disk.
+    fn reload_from_disk(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        self.load_file(&path);
+    }
+
+    fn resolve_pending(&mut self, ctx: &egui::Context, save: bool, discard: bool) {
+        let Some(action) = self.confirm.take() else { return };
+        if save {
+            self.save_file();
+            if self.save_error.is_some() {
+                // the write failed: stay put rather than losing the buffer
+                self.confirm = Some(action);
+                ctx.request_repaint();
+                return;
+            }
+        } else if !discard {
+            return; // cancelled
+        }
+        self.editing = false;
+        match action {
+            PendingAction::LeaveEdit => self.reparse(),
+            PendingAction::Reload => self.reload_from_disk(),
+            PendingAction::Open(path) => self.load_file(&path),
+        }
+        ctx.request_repaint();
     }
 
     fn reload_theme(&mut self) {
@@ -357,9 +494,10 @@ impl eframe::App for App {
         }
 
         // window title
+        let dirty_mark = if self.file_dirty { " •" } else { "" };
         let title = match &self.path {
             Some(p) => format!(
-                "{} — margdawn",
+                "{}{dirty_mark} — margdawn",
                 p.file_name().and_then(|n| n.to_str()).unwrap_or("margdawn")
             ),
             None => "margdawn — markdown viewer".to_string(),
@@ -369,10 +507,27 @@ impl eframe::App for App {
         // drag & drop
         let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
         if let Some(f) = dropped.iter().rev().find_map(|f| f.path.clone()) {
-            self.load_file(&f);
+            self.request_open(f);
         }
 
+        // ---- keyboard -------------------------------------------------------
         let ctrl_o = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O));
+        let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
+        let ctrl_e = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::E));
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            if self.confirm.is_some() {
+                self.confirm = None;
+            } else if self.editing {
+                self.toggle_edit();
+            }
+        }
+        if ctrl_s && self.editing && self.file_dirty {
+            self.save_file();
+        }
+        if ctrl_e && !self.confirm.is_some() {
+            self.toggle_edit();
+        }
 
         // ---- top bar --------------------------------------------------------
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -383,13 +538,11 @@ impl eframe::App for App {
                         .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
                         .pick_file()
                     {
-                        self.load_file(&path);
+                        self.request_open(path);
                     }
                 }
                 if self.path.is_some() && ui.button("Reload").clicked() {
-                    if let Some(p) = self.path.clone() {
-                        self.load_file(&p);
-                    }
+                    self.request_reload();
                 }
                 if ui.button("Settings").clicked() {
                     self.settings_open = !self.settings_open;
@@ -398,8 +551,32 @@ impl eframe::App for App {
                         self.theme_editing_colors = theme_slots(&self.theme.colors);
                     }
                 }
+                let edit_label = if self.editing { "Done" } else { "Edit" };
+                if ui
+                    .add_enabled(self.src.is_some(), egui::Button::new(edit_label))
+                    .on_hover_text("Edit the file in place (Ctrl+E)")
+                    .clicked()
+                {
+                    self.toggle_edit();
+                }
+                if self.editing
+                    && ui
+                        .add_enabled(self.file_dirty, egui::Button::new("Save"))
+                        .on_hover_text("Write the buffer to disk (Ctrl+S)")
+                        .clicked()
+                {
+                    self.save_file();
+                }
                 if let Some(p) = &self.path {
-                    ui.weak(p.display().to_string());
+                    let name = p.display().to_string();
+                    if self.file_dirty {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 170, 60),
+                            format!("{name} •"),
+                        );
+                    } else {
+                        ui.weak(name);
+                    }
                 }
             });
             ui.add_space(4.0);
@@ -428,9 +605,15 @@ impl eframe::App for App {
                         });
                     }
                     Some(doc) => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
+                        if self.editing {
+                            self.show_editor(ui);
+                        } else {
+                            let mut area = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false]);
+                            if let Some(y) = self.restore_offset.take() {
+                                area = area.vertical_scroll_offset(y);
+                            }
+                            let out = area.show(ui, |ui| {
                                 let mut view = View::new(
                                     Arc::clone(&self.theme),
                                     RenderCfg::from_config(&self.cfg, &self.theme),
@@ -440,6 +623,8 @@ impl eframe::App for App {
                                 );
                                 view.render_document(ui, doc);
                             });
+                            self.view_offset = out.state.offset.y;
+                        }
                     }
                 }
             });
@@ -447,6 +632,11 @@ impl eframe::App for App {
         // ---- settings window --------------------------------------------------
         if self.settings_open {
             self.show_settings(ctx);
+        }
+
+        // ---- unsaved-changes dialog -------------------------------------------
+        if let Some(action) = self.confirm.clone() {
+            self.show_confirm(ctx, action);
         }
 
         // ---- persistence ------------------------------------------------------
@@ -460,6 +650,100 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The edit pane: the raw source, styled as source.
+    ///
+    /// A plain `TextEdit` over the real bytes — the layouter only changes how
+    /// runs look, never what they are — so cursor, selection and undo all work
+    /// on the file itself.
+    fn show_editor(&mut self, ui: &mut egui::Ui) {
+        let c = &self.theme.colors;
+        let st = SyntaxStyle {
+            fg: c32(c.foreground()),
+            muted: c32(c.resolve(ColorKey::Muted, ColorKey::Foreground)),
+            heading: c32(c.resolve(ColorKey::Heading, ColorKey::Foreground)),
+            code: c32(c.resolve(ColorKey::Code, ColorKey::Foreground)),
+            link: c32(c.resolve(ColorKey::Link, ColorKey::Foreground)),
+            strong: c32(c.resolve(ColorKey::Strong, ColorKey::Foreground)),
+            emphasis: c32(c.resolve(ColorKey::Emphasis, ColorKey::Foreground)),
+            strike: c32(c.resolve(ColorKey::Strike, ColorKey::Muted)),
+            font: egui::FontId::monospace(self.cfg.font_size()),
+        };
+
+        if let Some(err) = &self.save_error {
+            ui.colored_label(egui::Color32::from_rgb(210, 90, 70), err);
+            ui.add_space(4.0);
+        }
+
+        let Some(src) = self.src.as_mut() else {
+            ui.centered_and_justified(|ui| ui.weak("No file open"));
+            return;
+        };
+
+        let mut layouter =
+            |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
+                let job = highlight(text, &st, wrap_width);
+                ui.fonts(|f| f.layout_job(job))
+            };
+
+        let edit = egui::TextEdit::multiline(src)
+            .desired_width(f32::INFINITY)
+            .desired_rows(24)
+            .frame(false)
+            .margin(egui::Margin::same(0.0))
+            .lock_focus(true)
+            .layouter(&mut layouter);
+
+        let resp = ui.add_sized(
+            [ui.available_width(), ui.available_height()],
+            edit,
+        );
+        if resp.changed() {
+            self.file_dirty = true;
+        }
+    }
+
+    /// Save / Discard / Cancel for a buffered action.
+    fn show_confirm(&mut self, ctx: &egui::Context, action: PendingAction) {
+        let what = match &action {
+            PendingAction::LeaveEdit => "leave edit mode",
+            PendingAction::Reload => "reload the file from disk",
+            PendingAction::Open(_) => "open another file",
+        };
+        let mut save = false;
+        let mut discard = false;
+        let mut cancel = false;
+
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("This file has unsaved changes. Save before you {what}?"));
+                if let Some(err) = &self.save_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(210, 90, 70), err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save || discard {
+            self.resolve_pending(ctx, save, discard);
+        } else if cancel {
+            self.confirm = None;
+        }
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
         let (user_themes, builtin_themes) = config::available_themes();
         let code_themes = margdawn_core::syn::code_theme_names();
@@ -789,8 +1073,8 @@ impl App {
     /// Developer hook (MARGDAWN_SCREENSHOT=path.png): saves one frame, quits.
     fn screenshot_tick(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot.clone() else { return };
-        ctx.request_repaint();
-        if self.frames == 12 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        if self.frames >= 6 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
         let shot = ctx.input(|i| {
