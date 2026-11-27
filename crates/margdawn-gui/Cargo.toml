@@ -10,6 +10,9 @@ authors.workspace = true
 margdawn-core = { path = "../margdawn-core" }
 eframe = { workspace = true }
 rfd = { workspace = true }
+# Clipboard with an HTML flavour, so a copy pastes into a word processor with
+# its formatting. egui-winit already pulls this in, but only uses set_text.
+arboard = { version = "3.7", features = ["wayland-data-control"] }
 png = "0.17"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 

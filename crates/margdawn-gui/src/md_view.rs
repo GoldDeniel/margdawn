@@ -33,6 +33,8 @@ pub struct RenderCfg {
     pub heading: Face,
     /// forced max image width, as a percentage of the content width
     pub image_max_width_percent: Option<f32>,
+    /// allow mouse selection in the rendered view
+    pub selectable_text: bool,
 }
 
 impl RenderCfg {
@@ -52,8 +54,517 @@ impl RenderCfg {
             body,
             heading,
             image_max_width_percent: cfg.image_max_width_percent(),
+            selectable_text: cfg.selectable_text(),
         }
     }
+}
+
+/// One end of a text selection: a galley/unit index plus a character offset
+/// into that unit's plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPos {
+    unit: usize,
+    offset: usize,
+}
+
+/// Where a selectable unit came from, used only to join neighbouring units
+/// into natural plain text / Markdown on copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    Block,
+    Heading,
+    Code,
+    TableCell { row: usize, col: usize, cols: usize },
+}
+
+/// A rendered piece of text that can be selected as a whole unit.
+#[derive(Debug)]
+struct Unit {
+    plain: String,
+    markdown: String,
+    /// `md_map[i]` is the Markdown character offset for plain boundary `i`.
+    md_map: Vec<usize>,
+    /// Style of each plain character, for rich (HTML) copy.
+    styles: Vec<CharStyle>,
+    kind: UnitKind,
+}
+
+/// Screen geometry of one unit for the current frame.
+struct UnitGeom {
+    unit: usize,
+    rect: egui::Rect,
+    clip: egui::Rect,
+    origin: egui::Pos2,
+    galley: Arc<egui::Galley>,
+    len: usize,
+}
+
+/// Mouse text selection over the rendered document.
+///
+/// Selection is tracked in logical (unit, character) coordinates so it survives
+/// scrolling. `units` is rebuilt every frame in render order.
+#[derive(Debug, Default)]
+pub struct Selection {
+    enabled: bool,
+    units: Vec<Unit>,
+    anchor: Option<SelectionPos>,
+    cursor: Option<SelectionPos>,
+    dragging: bool,
+}
+
+impl Selection {
+    fn begin_frame(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.units.clear();
+        if !enabled {
+            self.clear();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.anchor = None;
+        self.cursor = None;
+        self.dragging = false;
+    }
+
+    /// Select the whole rendered document.
+    ///
+    /// Used by `Ctrl+A` and by the developer self-test hook, which needs a
+    /// selection without a mouse.
+    pub fn select_all(&mut self) {
+        if self.units.is_empty() {
+            self.clear();
+            return;
+        }
+        self.anchor = Some(SelectionPos { unit: 0, offset: 0 });
+        let last = self.units.len() - 1;
+        let end = self.units[last].plain.chars().count();
+        self.cursor = Some(SelectionPos { unit: last, offset: end });
+        self.dragging = false;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.ordered().is_some_and(|(a, b)| a != b)
+    }
+
+    fn push_unit(&mut self, unit: Unit) -> usize {
+        self.units.push(unit);
+        self.units.len() - 1
+    }
+
+    fn ordered(&self) -> Option<(SelectionPos, SelectionPos)> {
+        let anchor = self.anchor?;
+        let cursor = self.cursor?;
+        if anchor.unit >= self.units.len() || cursor.unit >= self.units.len() {
+            return None;
+        }
+        Some(if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        })
+    }
+
+    /// Selected text with inline markup (bold markers, code ticks) removed.
+    pub fn plain_text(&self) -> Option<String> {
+        self.collect(false)
+    }
+
+    /// Selected text with the original Markdown markup included.
+    pub fn markdown_text(&self) -> Option<String> {
+        self.collect(true)
+    }
+
+    /// Selected text as an HTML fragment, so pasting into a word processor
+    /// keeps bold, italic, strikethrough and code.
+    ///
+    /// egui's clipboard only carries plain text, so this is handed to the
+    /// platform clipboard separately (see `clipboard_html`).
+    pub fn html(&self) -> Option<String> {
+        let (a, b) = self.ordered()?;
+        if a == b {
+            return None;
+        }
+        let mut out = String::new();
+        let count = self.units.len();
+        for (i, unit) in self.units.iter().enumerate() {
+            let plain_len = unit.plain.chars().count();
+            let from = if i == a.unit { a.offset.min(plain_len) } else { 0 };
+            let to = if i == b.unit { b.offset.min(plain_len) } else { plain_len };
+            if from >= to {
+                continue;
+            }
+            let at_block_start = i == a.unit || i == 0;
+            if !at_block_start && i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&html_runs(unit, from, to));
+            if i + 1 == count && i != a.unit {
+                break;
+            }
+        }
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    fn collect(&self, markdown: bool) -> Option<String> {
+        let (a, b) = self.ordered()?;
+        if a == b {
+            return None;
+        }
+        let mut out = String::new();
+        let mut prev: Option<UnitKind> = None;
+        let mut any = false;
+        for i in a.unit..=b.unit {
+            let Some(unit) = self.units.get(i) else { continue };
+            let plain_len = unit.plain.chars().count();
+            let from = if i == a.unit { a.offset.min(plain_len) } else { 0 };
+            let to = if i == b.unit { b.offset.min(plain_len) } else { plain_len };
+            if from >= to {
+                continue;
+            }
+            if let Some(prev) = prev {
+                out.push_str(separator(prev, unit.kind, markdown));
+            }
+            if markdown {
+                let md_len = unit.markdown.chars().count();
+                let m0 = unit.md_map.get(from).copied().unwrap_or(0).min(md_len);
+                let m1 = unit.md_map.get(to).copied().unwrap_or(md_len).min(md_len);
+                out.push_str(&slice_chars(&unit.markdown, m0, m1));
+            } else {
+                out.push_str(&slice_chars(&unit.plain, from, to));
+            }
+            prev = Some(unit.kind);
+            any = true;
+        }
+        any.then_some(out)
+    }
+
+    fn hit(&self, geoms: &[UnitGeom], pos: egui::Pos2) -> Option<SelectionPos> {
+        let g = geoms.iter().find(|g| g.rect.contains(pos))?;
+        Some(self.hit_in(g, pos))
+    }
+
+    fn hit_in(&self, g: &UnitGeom, pos: egui::Pos2) -> SelectionPos {
+        let clamped = egui::pos2(
+            pos.x.clamp(g.rect.left(), g.rect.right()),
+            pos.y.clamp(g.rect.top(), g.rect.bottom()),
+        );
+        let idx = g.galley.cursor_from_pos(clamped - g.origin).ccursor.index;
+        SelectionPos { unit: g.unit, offset: idx.min(g.len) }
+    }
+
+    fn nearest(&self, geoms: &[UnitGeom], pos: egui::Pos2) -> Option<SelectionPos> {
+        let g = geoms.iter().min_by(|a, b| {
+            let da = a.rect.distance_sq_to_pos(pos);
+            let db = b.rect.distance_sq_to_pos(pos);
+            da.total_cmp(&db)
+        })?;
+        Some(self.hit_in(g, pos))
+    }
+
+    /// Update the selection from pointer input, then paint every affected unit.
+    fn end_frame(&mut self, ui: &egui::Ui, geoms: &[UnitGeom]) {
+        if !self.enabled || self.units.is_empty() {
+            if !self.enabled {
+                self.clear();
+            }
+            return;
+        }
+        if self
+            .anchor
+            .is_some_and(|p| p.unit >= self.units.len())
+            || self.cursor.is_some_and(|p| p.unit >= self.units.len())
+        {
+            self.clear();
+        }
+
+        let (pos, pressed, down, released) = ui.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+            )
+        });
+
+        if pressed {
+            if let Some(pos) = pos {
+                if let Some(hit) = self.hit(geoms, pos) {
+                    self.anchor = Some(hit);
+                    self.cursor = Some(hit);
+                    self.dragging = true;
+                }
+            }
+        }
+        if self.dragging && down {
+            if let Some(pos) = pos {
+                if let Some(hit) = self.hit(geoms, pos).or_else(|| self.nearest(geoms, pos)) {
+                    self.cursor = Some(hit);
+                }
+            }
+        }
+        if released || !down {
+            self.dragging = false;
+        }
+
+        self.paint(ui, geoms);
+    }
+
+    fn paint(&self, ui: &egui::Ui, geoms: &[UnitGeom]) {
+        let Some((a, b)) = self.ordered() else { return };
+        if a == b {
+            return;
+        }
+        for g in geoms {
+            if g.unit < a.unit || g.unit > b.unit {
+                continue;
+            }
+            let from = if g.unit == a.unit { a.offset } else { 0 };
+            let to = if g.unit == b.unit { b.offset } else { g.len };
+            let from = from.min(g.len);
+            let to = to.min(g.len);
+            if from >= to {
+                continue;
+            }
+            let range = egui::text_selection::CursorRange::two(
+                g.galley.from_ccursor(egui::text::CCursor::new(from)),
+                g.galley.from_ccursor(egui::text::CCursor::new(to)),
+            );
+            let painter = ui.painter().with_clip_rect(g.clip);
+            egui::text_selection::visuals::paint_text_selection(
+                &painter,
+                ui.visuals(),
+                g.origin,
+                &g.galley,
+                &range,
+                None,
+            );
+        }
+    }
+}
+
+fn slice_chars(s: &str, from: usize, to: usize) -> String {
+    s.chars().skip(from).take(to.saturating_sub(from)).collect()
+}
+
+fn separator(prev: UnitKind, next: UnitKind, markdown: bool) -> &'static str {
+    match (prev, next) {
+        (
+            UnitKind::TableCell { row: r1, .. },
+            UnitKind::TableCell { row: r2, .. },
+        ) if r1 == r2 => {
+            if markdown {
+                " | "
+            } else {
+                " "
+            }
+        }
+        _ => {
+            if markdown {
+                "\n\n"
+            } else {
+                "\n"
+            }
+        }
+    }
+}
+
+/// Builds a unit's plain text plus its Markdown mirror and offset map.
+struct MdBuilder {
+    plain: String,
+    markdown: String,
+    md_chars: usize,
+    map: Vec<usize>,
+    /// Style of each plain character, so a selection can be turned into rich
+    /// HTML and pasted into a word processor with its formatting intact.
+    styles: Vec<CharStyle>,
+    /// Style applied to text appended right now.
+    current: CharStyle,
+}
+
+/// The inline formatting of one plain character, flattened for HTML output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CharStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    code: bool,
+    link: bool,
+}
+
+impl MdBuilder {
+    fn new() -> Self {
+        Self {
+            plain: String::new(),
+            markdown: String::new(),
+            md_chars: 0,
+            map: vec![0],
+            styles: Vec::new(),
+            current: CharStyle::default(),
+        }
+    }
+
+    /// Append literal text that appears identically in both forms.
+    fn text(&mut self, text: &str) {
+        let n = text.chars().count();
+        let base = self.md_chars;
+        self.plain.push_str(text);
+        self.markdown.push_str(text);
+        self.md_chars += n;
+        for k in 1..=n {
+            self.map.push(base + k);
+            self.styles.push(self.current);
+        }
+    }
+
+    /// Start a styled span; the boundary before it maps before the prefix so
+    /// selecting the whole span includes the markup.
+    fn span_start(&mut self, prefix: &str) {
+        if let Some(last) = self.map.last_mut() {
+            *last = self.md_chars;
+        }
+        self.markdown.push_str(prefix);
+        self.md_chars += prefix.chars().count();
+    }
+
+    fn span_end(&mut self, suffix: &str) {
+        self.markdown.push_str(suffix);
+        self.md_chars += suffix.chars().count();
+        if let Some(last) = self.map.last_mut() {
+            *last = self.md_chars;
+        }
+    }
+
+    /// Per-plain-character styles built so far, taken before [`Self::finish`]
+    /// consumes the builder.
+    fn take_styles(&mut self) -> Vec<CharStyle> {
+        std::mem::take(&mut self.styles)
+    }
+
+    fn finish(mut self, prefix: &str, suffix: &str) -> (String, String, Vec<usize>) {
+        let plen = prefix.chars().count();
+        if plen > 0 {
+            for m in self.map.iter_mut().skip(1) {
+                *m += plen;
+            }
+            if let Some(first) = self.map.first_mut() {
+                *first = 0;
+            }
+            self.markdown.insert_str(0, prefix);
+            self.md_chars += plen;
+        }
+        if !suffix.is_empty() {
+            self.markdown.push_str(suffix);
+            self.md_chars += suffix.chars().count();
+            if let Some(last) = self.map.last_mut() {
+                *last = self.md_chars;
+            }
+        }
+        (self.plain, self.markdown, self.map)
+    }
+}
+
+/// Emit `unit.plain[from..to]` as HTML, wrapping each run in the tags its
+/// recorded style calls for. Adjacent characters of identical style share one
+/// tag pair so the markup stays readable.
+fn html_runs(unit: &Unit, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut run_style: Option<CharStyle> = None;
+
+    let flush = |out: &mut String, run: &mut String, style: Option<CharStyle>| {
+        if run.is_empty() {
+            return;
+        }
+        let s = style.unwrap_or_default();
+        // Innermost first, closed in reverse order.
+        if s.code {
+            out.push_str("<code>");
+        }
+        if s.link {
+            out.push_str("<u>");
+        }
+        if s.strike {
+            out.push_str("<del>");
+        }
+        if s.italic {
+            out.push_str("<i>");
+        }
+        if s.bold {
+            out.push_str("<b>");
+        }
+        out.push_str(run);
+        if s.bold {
+            out.push_str("</b>");
+        }
+        if s.italic {
+            out.push_str("</i>");
+        }
+        if s.strike {
+            out.push_str("</del>");
+        }
+        if s.link {
+            out.push_str("</u>");
+        }
+        if s.code {
+            out.push_str("</code>");
+        }
+        run.clear();
+    };
+
+    for (idx, ch) in unit.plain.chars().enumerate() {
+        if idx < from || idx >= to {
+            continue;
+        }
+        let style = unit.styles.get(idx).copied().unwrap_or_default();
+        if run_style.is_some_and(|s| s != style) {
+            flush(&mut out, &mut run, run_style);
+        }
+        run_style = Some(style);
+        match ch {
+            '<' => run.push_str("&lt;"),
+            '>' => run.push_str("&gt;"),
+            '&' => run.push_str("&amp;"),
+            _ => run.push(ch),
+        }
+    }
+    flush(&mut out, &mut run, run_style);
+    out
+}
+
+fn span_markers(span: &Span) -> (String, String) {
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    if span.bold {
+        prefix.push_str("**");
+    }
+    if span.italic {
+        prefix.push('*');
+    }
+    if span.strike {
+        prefix.push_str("~~");
+    }
+    if let Some(img) = &span.image {
+        prefix.push_str("![");
+        suffix.push_str(&format!("]({})", img.src));
+    } else if let Some(link) = &span.link {
+        prefix.push('[');
+        suffix.push_str(&format!("]({link})"));
+    }
+    if span.code {
+        prefix.push('`');
+        suffix.push('`');
+    }
+    if span.strike {
+        suffix.push_str("~~");
+    }
+    if span.italic {
+        suffix.push('*');
+    }
+    if span.bold {
+        suffix.push_str("**");
+    }
+    (prefix, suffix)
 }
 
 /// Per-section data kept next to a `LayoutJob` (index == section index).
@@ -80,6 +591,8 @@ pub struct View {
     /// directory of the open document, for resolving relative image paths
     base_dir: Option<std::path::PathBuf>,
     widget_id: u64,
+    /// selectable unit geometry collected while rendering this frame
+    geoms: Vec<UnitGeom>,
 }
 
 impl View {
@@ -90,12 +603,27 @@ impl View {
         images: Rc<ImageStore>,
         base_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        Self { theme, cfg, emoji, images, base_dir, widget_id: 0 }
+        Self {
+            theme,
+            cfg,
+            emoji,
+            images,
+            base_dir,
+            widget_id: 0,
+            geoms: Vec::new(),
+        }
     }
 
     // ---- document / spacing -------------------------------------------------
 
-    pub fn render_document(&mut self, ui: &mut egui::Ui, doc: &margdawn_core::md::Document) {
+    pub fn render_document(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &margdawn_core::md::Document,
+        selection: &mut Selection,
+    ) {
+        self.geoms.clear();
+        selection.begin_frame(self.cfg.selectable_text);
         // all vertical rhythm is explicit (gap_between); egui adds nothing
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         let mut prev: Option<&Block> = None;
@@ -107,9 +635,10 @@ impl View {
                         + extra as f32 * self.cfg.paragraph_spacing,
                 );
             }
-            self.render_block(ui, &db.block);
+            self.render_block(ui, &db.block, "", selection);
             prev = Some(&db.block);
         }
+        selection.end_frame(ui, &self.geoms);
     }
 
     /// Vertical gap between two sibling blocks.
@@ -130,12 +659,18 @@ impl View {
         }
     }
 
-    fn render_children(&mut self, ui: &mut egui::Ui, blocks: &[Block]) {
+    fn render_children(
+        &mut self,
+        ui: &mut egui::Ui,
+        blocks: &[Block],
+        md_prefix: &str,
+        selection: &mut Selection,
+    ) {
         for (i, b) in blocks.iter().enumerate() {
             if i > 0 {
                 ui.add_space(self.gap_between(&blocks[i - 1], b) * 0.6);
             }
-            self.render_block(ui, b);
+            self.render_block(ui, b, md_prefix, selection);
         }
     }
 
@@ -179,9 +714,10 @@ impl View {
         size: f32,
         face: Face,
         bold_all: bool,
-    ) -> (egui::text::LayoutJob, Vec<SectionMeta>) {
+    ) -> (egui::text::LayoutJob, Vec<SectionMeta>, MdBuilder) {
         let mut job = egui::text::LayoutJob::default();
         let mut meta: Vec<SectionMeta> = Vec::new();
+        let mut md = MdBuilder::new();
         let colors = &self.theme.colors;
         let line_height = Some(size * self.cfg.line_height);
         let chip_pad_x = size * 0.24;
@@ -206,6 +742,17 @@ impl View {
             };
             let font_size = if span.code { size * 0.92 } else { size };
             let font_id = egui::FontId::new(font_size, family);
+            let (marker_open, marker_close) = span_markers(span);
+            // Record the style so a selection can be re-emitted as HTML with
+            // the formatting a word processor understands.
+            md.current = CharStyle {
+                bold: span.bold || bold_all,
+                italic: span.italic,
+                strike: span.strike,
+                code: span.code,
+                link: span.link.is_some(),
+            };
+            md.span_start(&marker_open);
             // inline-code chips get padding before/after their text
             if span.code {
                 job.append("", chip_pad_x, egui::TextFormat::default());
@@ -242,6 +789,7 @@ impl View {
                             emoji: None,
                             inline_code: span.code,
                         });
+                        md.text(t);
                         if span.code {
                             leading_next = chip_pad_x;
                         }
@@ -271,6 +819,7 @@ impl View {
                                 }),
                                 inline_code: false,
                             });
+                            md.text("\u{2003}");
                         }
                         None => {
                             let lead = leading_next;
@@ -281,6 +830,7 @@ impl View {
                                 emoji: None,
                                 inline_code: span.code,
                             });
+                            md.text(cluster);
                             if span.code {
                                 leading_next = chip_pad_x;
                             }
@@ -288,8 +838,9 @@ impl View {
                     },
                 }
             }
+            md.span_end(&marker_close);
         }
-        (job, meta)
+        (job, meta, md)
     }
 
     /// Paint a laid-out galley plus its color emoji.
@@ -383,6 +934,7 @@ impl View {
     }
 
     /// A wrapped inline flow (paragraph, heading, list-item text).
+    #[allow(clippy::too_many_arguments)]
     fn paint_inline(
         &mut self,
         ui: &mut egui::Ui,
@@ -391,31 +943,107 @@ impl View {
         size: f32,
         face: Face,
         bold_all: bool,
+        md_prefix: &str,
+        kind: UnitKind,
+        selection: &mut Selection,
     ) {
         if spans.is_empty() {
             return;
         }
-        let (mut job, meta) = self.build_job(ui.ctx(), spans, base, size, face, bold_all);
+        let (mut job, meta, md) = self.build_job(ui.ctx(), spans, base, size, face, bold_all);
         job.wrap.max_width = ui.available_width();
         let galley = ui.painter().layout_job(job);
-        let (rect, resp) = ui.allocate_exact_size(galley.rect.size(), egui::Sense::click());
+        let sense = if self.cfg.selectable_text {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        };
+        let (rect, resp) = ui.allocate_exact_size(galley.rect.size(), sense);
         self.paint_galley(ui, rect.min, &galley, &meta, size);
+        self.push_unit(
+            md,
+            md_prefix,
+            "",
+            kind,
+            rect,
+            ui.clip_rect(),
+            rect.min,
+            &galley,
+            selection,
+        );
         self.handle_links(ui, rect.min, &galley, &meta, &resp);
+    }
+
+    /// Register one selectable galley and remember where it was painted.
+    #[allow(clippy::too_many_arguments)]
+    fn push_unit(
+        &mut self,
+        md: MdBuilder,
+        prefix: &str,
+        suffix: &str,
+        kind: UnitKind,
+        rect: egui::Rect,
+        clip: egui::Rect,
+        origin: egui::Pos2,
+        galley: &Arc<egui::Galley>,
+        selection: &mut Selection,
+    ) {
+        let mut md = md;
+        let styles = md.take_styles();
+        let (plain, markdown, md_map) = md.finish(prefix, suffix);
+        let unit = selection.push_unit(Unit { plain, markdown, md_map, styles, kind });
+        self.geoms.push(UnitGeom {
+            unit,
+            rect,
+            clip,
+            origin,
+            galley: Arc::clone(galley),
+            len: galley.text().chars().count(),
+        });
     }
 
     // ---- blocks ------------------------------------------------------------
 
-    fn render_block(&mut self, ui: &mut egui::Ui, block: &Block) {
+    fn render_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &Block,
+        md_prefix: &str,
+        selection: &mut Selection,
+    ) {
         let ps = self.cfg.paragraph_spacing;
         match block {
             Block::Paragraph(spans) => {
-                self.paint_inline(ui, spans, ColorKey::Foreground, self.cfg.font_size, self.cfg.body, false);
+                self.paint_inline(
+                    ui,
+                    spans,
+                    ColorKey::Foreground,
+                    self.cfg.font_size,
+                    self.cfg.body,
+                    false,
+                    md_prefix,
+                    UnitKind::Block,
+                    selection,
+                );
             }
             Block::Heading(level, spans) => {
                 let heading = self.cfg.heading;
-                self.paint_inline(ui, spans, ColorKey::Heading, self.heading_size(*level), heading, true);
+                let prefix = format!("{md_prefix}{} ", "#".repeat(*level as usize));
+                self.paint_inline(
+                    ui,
+                    spans,
+                    ColorKey::Heading,
+                    self.heading_size(*level),
+                    heading,
+                    true,
+                    &prefix,
+                    UnitKind::Heading,
+                    selection,
+                );
             }
-            Block::CodeBlock { lang, text } => self.render_code_block(ui, lang.as_deref(), text),
+            Block::CodeBlock { lang, text } => {
+                self.render_code_block(ui, lang.as_deref(), text, selection)
+            }
             Block::Quote(_depth, blocks) => {
                 let bar = self
                     .theme
@@ -423,13 +1051,14 @@ impl View {
                     .quote_bar
                     .unwrap_or_else(|| self.theme.colors.foreground());
                 let tint = self.theme.colors.background().blend(bar, 0.07);
+                let quote_prefix = format!("{md_prefix}> ");
                 let resp = egui::Frame::none()
                     .fill(c32(tint))
                     .rounding(4.0)
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        self.render_children(ui, blocks);
+                        self.render_children(ui, blocks, &quote_prefix, selection);
                     });
                 let rect = resp.response.rect;
                 ui.painter().rect_filled(
@@ -441,8 +1070,12 @@ impl View {
                     c32(bar),
                 );
             }
-            Block::List { ordered, start, items } => self.render_list(ui, *ordered, *start, items),
-            Block::Table { align, header, rows } => self.render_table(ui, align, header, rows),
+            Block::List { ordered, start, items } => {
+                self.render_list(ui, *ordered, *start, items, md_prefix, selection)
+            }
+            Block::Table { align, header, rows } => {
+                self.render_table(ui, align, header, rows, selection)
+            }
             Block::Image(image) => self.render_image(ui, image),
             Block::Rule => {
                 let (rect, _) = ui.allocate_exact_size(
@@ -466,7 +1099,7 @@ impl View {
                             .color(muted)
                             .size(self.cfg.font_size * 0.85),
                     );
-                    ui.vertical(|ui| self.render_children(ui, blocks));
+                    ui.vertical(|ui| self.render_children(ui, blocks, md_prefix, selection));
                 });
             }
         }
@@ -520,7 +1153,13 @@ impl View {
         }
     }
 
-    fn render_code_block(&mut self, ui: &mut egui::Ui, lang: Option<&str>, text: &str) {
+    fn render_code_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Option<&str>,
+        text: &str,
+        selection: &mut Selection,
+    ) {
         let hl = syn::highlight(lang, text, &self.cfg.code_theme);
         let id = self.next_id();
         let size = self.cfg.font_size * 0.92;
@@ -535,9 +1174,11 @@ impl View {
             color: c32(hl.foreground),
             ..Default::default()
         };
+        let mut plain = String::new();
         for (i, runs) in hl.lines.iter().enumerate() {
             if i > 0 {
                 job.append("\n", 0.0, default_fmt.clone());
+                plain.push('\n');
             }
             for (color, run) in runs {
                 job.append(
@@ -545,12 +1186,14 @@ impl View {
                     0.0,
                     egui::TextFormat { color: c32(*color), ..default_fmt.clone() },
                 );
+                plain.push_str(run);
             }
         }
         if job.is_empty() {
             job.append(" ", 0.0, default_fmt.clone());
         }
         let galley = ui.painter().layout_job(job);
+        let fence = format!("```{}\n", lang.unwrap_or(""));
 
         egui::Frame::none()
             .fill(c32(hl.background))
@@ -559,25 +1202,62 @@ impl View {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let avail = ui.available_width();
+                let sense = if self.cfg.selectable_text {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::hover()
+                };
                 if galley.rect.width() <= avail {
-                    let (rect, _) =
-                        ui.allocate_exact_size(galley.rect.size(), egui::Sense::hover());
+                    let (rect, _) = ui.allocate_exact_size(galley.rect.size(), sense);
                     ui.painter().galley(rect.min, galley.clone(), c32(hl.foreground));
+                    let mut mdb = MdBuilder::new();
+                    mdb.text(&plain);
+                    self.push_unit(
+                        mdb,
+                        &fence,
+                        "\n```",
+                        UnitKind::Code,
+                        rect,
+                        ui.clip_rect(),
+                        rect.min,
+                        &galley,
+                        selection,
+                    );
                 } else {
                     ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
                     egui::ScrollArea::horizontal()
                         .id_source(id)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(galley.rect.size(), egui::Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(galley.rect.size(), sense);
                             ui.painter().galley(rect.min, galley.clone(), c32(hl.foreground));
+                            let mut mdb = MdBuilder::new();
+                            mdb.text(&plain);
+                            self.push_unit(
+                                mdb,
+                                &fence,
+                                "\n```",
+                                UnitKind::Code,
+                                rect,
+                                ui.clip_rect(),
+                                rect.min,
+                                &galley,
+                                selection,
+                            );
                         });
                 }
             });
     }
 
-    fn render_list(&mut self, ui: &mut egui::Ui, ordered: bool, start: u64, items: &[Vec<Block>]) {
+    fn render_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        ordered: bool,
+        start: u64,
+        items: &[Vec<Block>],
+        md_prefix: &str,
+        selection: &mut Selection,
+    ) {
         let marker_col = c32(
             self.theme
                 .colors
@@ -598,6 +1278,11 @@ impl View {
             } else {
                 "\u{2022}".to_string()
             };
+            let md_marker = if ordered {
+                format!("{}. ", start + i as u64)
+            } else {
+                "- ".to_string()
+            };
             // horizontal_top: the marker stays aligned with the item's first line
             ui.horizontal_top(|ui| {
                 let (slot, _) = ui.allocate_exact_size(egui::vec2(slot_w, row_h), egui::Sense::hover());
@@ -608,7 +1293,19 @@ impl View {
                     egui::FontId::new(size, fonts::family(body, ordered, false)),
                     marker_col,
                 );
-                ui.vertical(|ui| self.render_children(ui, item));
+                ui.vertical(|ui| {
+                    for (j, block) in item.iter().enumerate() {
+                        if j > 0 {
+                            ui.add_space(self.gap_between(&item[j - 1], block) * 0.6);
+                        }
+                        let prefix = if j == 0 {
+                            format!("{md_prefix}{md_marker}")
+                        } else {
+                            format!("{md_prefix}  ")
+                        };
+                        self.render_block(ui, block, &prefix, selection);
+                    }
+                });
             });
         }
     }
@@ -619,15 +1316,22 @@ impl View {
         align: &[CellAlign],
         header: &[Vec<Span>],
         rows: &[Vec<Vec<Span>>],
+        selection: &mut Selection,
     ) {
         struct Cell {
             galley: Arc<egui::Galley>,
             meta: Vec<SectionMeta>,
+            unit: usize,
+            len: usize,
         }
 
         let id = self.next_id();
         let size = self.cfg.font_size;
         let pad = egui::vec2(size * 0.8, size * 0.5);
+        let cols = std::iter::once(header.len())
+            .chain(rows.iter().map(|r| r.len()))
+            .max()
+            .unwrap_or(0);
 
         // 1. lay out every cell at its natural (unwrapped) size
         let mut grid: Vec<Vec<Cell>> = Vec::new();
@@ -641,8 +1345,8 @@ impl View {
                 header_rows += 1;
             }
             let mut cells = Vec::new();
-            for spans in row {
-                let (mut job, meta) = self.build_job(
+            for (c, spans) in row.iter().enumerate() {
+                let (mut job, meta, md) = self.build_job(
                     ui.ctx(),
                     spans,
                     ColorKey::Foreground,
@@ -651,7 +1355,18 @@ impl View {
                     is_header,
                 );
                 job.wrap.max_width = f32::INFINITY;
-                cells.push(Cell { galley: ui.painter().layout_job(job), meta });
+                let mut md = md;
+                let styles = md.take_styles();
+                let (plain, markdown, md_map) = md.finish(
+                    if c == 0 { "| " } else { "" },
+                    if c + 1 == cols { " |" } else { "" },
+                );
+                let kind = UnitKind::TableCell { row: grid.len(), col: c, cols };
+                let unit =
+                    selection.push_unit(Unit { plain, markdown, md_map, styles, kind });
+                let galley = ui.painter().layout_job(job);
+                let len = galley.text().chars().count();
+                cells.push(Cell { galley, meta, unit, len });
             }
             grid.push(cells);
         }
@@ -660,7 +1375,6 @@ impl View {
         }
 
         // 2. column widths / row heights from content
-        let cols = grid.iter().map(Vec::len).max().unwrap_or(0);
         let mut col_w = vec![size * 2.0; cols];
         let mut row_h = vec![size * self.cfg.line_height + pad.y * 2.0; grid.len()];
         for (r, row) in grid.iter().enumerate() {
@@ -717,6 +1431,18 @@ impl View {
                                 egui::vec2(col_w[c], row_h[r]),
                             );
                             let resp = ui.interact(cell_rect, id.with((r, c)), egui::Sense::click());
+                            // Register the cell as a selectable unit so a drag
+                            // over the table copies its text like any block.
+                            if selection.enabled {
+                                self.geoms.push(UnitGeom {
+                                    unit: cell.unit,
+                                    rect: cell_rect,
+                                    clip: ui.clip_rect(),
+                                    origin,
+                                    galley: Arc::clone(&cell.galley),
+                                    len: cell.len,
+                                });
+                            }
                             self.paint_galley(ui, origin, &cell.galley, &cell.meta, size);
                             self.handle_links(ui, origin, &cell.galley, &cell.meta, &resp);
                             x += col_w[c];
@@ -824,4 +1550,365 @@ fn run_rect(row: &egui::Rect, x1: f32, x2: f32) -> egui::Rect {
         egui::pos2(x1.min(x2), row.top()),
         egui::pos2(x1.max(x2), row.bottom()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unit built by the real `MdBuilder`, so the plain↔markdown offset map
+    /// is the one the renderer actually produces.
+    fn built_unit(build: impl FnOnce(&mut MdBuilder)) -> Unit {
+        let mut md = MdBuilder::new();
+        build(&mut md);
+        let styles = md.take_styles();
+        let (plain, markdown, md_map) = md.finish("", "");
+        Unit {
+            plain,
+            markdown,
+            md_map,
+            styles,
+            kind: UnitKind::Block,
+        }
+    }
+
+    fn selection_over(units: Vec<Unit>, from: SelectionPos, to: SelectionPos) -> Selection {
+        let mut s = Selection::default();
+        s.enabled = true;
+        for u in units {
+            s.push_unit(u);
+        }
+        s.anchor = Some(from);
+        s.cursor = Some(to);
+        s
+    }
+
+    fn whole_unit(unit: usize, len: usize) -> (SelectionPos, SelectionPos) {
+        (
+            SelectionPos { unit, offset: 0 },
+            SelectionPos { unit, offset: len },
+        )
+    }
+
+    #[test]
+    fn plain_copy_strips_inline_markup() {
+        let unit = built_unit(|md| {
+            md.span_start("**");
+            md.text("bold");
+            md.span_end("**");
+        });
+        assert_eq!(unit.plain, "bold");
+        assert_eq!(unit.markdown, "**bold**");
+        let (a, b) = whole_unit(0, 4);
+        let s = selection_over(vec![unit], a, b);
+        assert_eq!(s.plain_text().as_deref(), Some("bold"));
+    }
+
+    #[test]
+    fn markdown_copy_keeps_the_markers() {
+        let unit = built_unit(|md| {
+            md.span_start("**");
+            md.text("bold");
+            md.span_end("**");
+        });
+        let (a, b) = whole_unit(0, 4);
+        let s = selection_over(vec![unit], a, b);
+        assert_eq!(s.markdown_text().as_deref(), Some("**bold**"));
+    }
+
+    #[test]
+    fn a_click_without_drag_selects_nothing() {
+        let at = SelectionPos { unit: 0, offset: 3 };
+        let s = selection_over(
+            vec![built_unit(|md| md.text("abc"))],
+            at,
+            at,
+        );
+        assert!(!s.has_selection());
+        assert_eq!(s.plain_text(), None);
+        assert_eq!(s.markdown_text(), None);
+    }
+
+    #[test]
+    fn a_reverse_drag_reads_forwards() {
+        let s = selection_over(
+            vec![built_unit(|md| md.text("alpha"))],
+            SelectionPos { unit: 0, offset: 5 },
+            SelectionPos { unit: 0, offset: 0 },
+        );
+        assert_eq!(s.plain_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_selection_across_units_joins_them() {
+        let s = selection_over(
+            vec![
+                built_unit(|md| md.text("first")),
+                built_unit(|md| md.text("second")),
+            ],
+            SelectionPos { unit: 0, offset: 0 },
+            SelectionPos { unit: 1, offset: 6 },
+        );
+        let text = s.plain_text().unwrap();
+        assert!(text.starts_with("first"), "got {text:?}");
+        assert!(text.ends_with("second"), "got {text:?}");
+    }
+
+    /// With selectable text switched off, a pre-existing drag must not copy.
+    #[test]
+    fn disabled_selection_copies_nothing() {
+        let mut s = selection_over(
+            vec![built_unit(|md| md.text("abc"))],
+            SelectionPos { unit: 0, offset: 0 },
+            SelectionPos { unit: 0, offset: 3 },
+        );
+        assert!(s.has_selection(), "the drag itself is tracked");
+        s.begin_frame(false);
+        assert!(s.anchor.is_none() && s.cursor.is_none());
+        assert!(!s.has_selection());
+    }
+}
+
+/// End-to-end selection: drive the real render path inside an egui context with
+/// synthetic pointer and keyboard events, then read what reached the clipboard.
+///
+/// Everything — context, fonts, layout, events — happens on one big-stack
+/// thread. An egui `Context` built on the test thread and driven from another
+/// recurses until the stack dies, so it must never be shared across threads.
+#[cfg(test)]
+mod selection_input_tests {
+    use super::*;
+    use margdawn_core::md::parse;
+
+    const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
+
+    fn run_on_big_stack(f: fn()) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, &margdawn_core::config::Config::default());
+        ctx
+    }
+
+    fn view(selectable: bool) -> View {
+        let theme = Arc::new(margdawn_core::theme::builtin("claude").expect("builtin theme"));
+        let cfg = RenderCfg {
+            font_size: 15.0,
+            line_height: 1.6,
+            paragraph_spacing: 8.0,
+            preserve_blank_lines: false,
+            code_theme: String::new(),
+            body: Face::Serif,
+            heading: Face::Serif,
+            image_max_width_percent: None,
+            selectable_text: selectable,
+        };
+        View::new(theme, cfg, Rc::new(EmojiStore::new()), Rc::new(ImageStore::new()), None)
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut View,
+        sel: &mut Selection,
+        doc: &margdawn_core::md::Document,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Default::default(), SCREEN)),
+            ..Default::default()
+        };
+        input.events = events;
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    // mirror the app: a selectable view must not let the scroll
+                    // area claim the drag for drag-to-scroll
+                    .drag_to_scroll(!view.cfg.selectable_text)
+                    .show(ui, |ui| view.render_document(ui, doc, sel));
+            });
+        })
+    }
+
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// Drag across the last registered unit and report the resulting state.
+    fn drag_and_copy(selectable: bool) -> (bool, String) {
+        let ctx = ctx();
+        // long enough that the content overflows the viewport, which is the
+        // condition under which a scroll area starts stealing drags
+        let long: String = (0..80).map(|i| format!("Paragraph {i} with some words to drag over.\n\n")).collect();
+        let doc = parse(&format!("# Title\n\n{long}"));
+        let mut v = view(selectable);
+        let mut sel = Selection::default();
+
+        frame(&ctx, &mut v, &mut sel, &doc, vec![]);
+        assert!(!v.geoms.is_empty(), "the document registered geometry");
+        // Drag the *second* paragraph: it is on screen (the first is the
+        // heading, which the app renders differently) and inside the viewport,
+        // which is where a real mouse drags.
+        let r = v.geoms[1].rect;
+        let a = egui::pos2(r.left() + 2.0, r.center().y);
+        let b = egui::pos2(r.left() + r.width() * 0.7, r.center().y);
+        let mid = egui::pos2((a.x + b.x) / 2.0, a.y);
+
+        for ev in [
+            vec![egui::Event::PointerMoved(a)],
+            vec![press(a, true)],
+            vec![egui::Event::PointerMoved(mid)],
+            vec![egui::Event::PointerMoved(b)],
+            vec![press(b, false)],
+        ] {
+            frame(&ctx, &mut v, &mut sel, &doc, ev);
+        }
+        let selected = sel.has_selection();
+        let plain = sel.plain_text().unwrap_or_default();
+
+        (selected, plain)
+    }
+
+    #[test]
+    fn dragging_over_text_records_a_selection() {
+        run_on_big_stack(|| {
+            let (selected, plain) = drag_and_copy(true);
+            assert!(selected, "a drag over the paragraph selects text");
+            assert!(!plain.trim().is_empty(), "selected text is not empty, got {plain:?}");
+        });
+    }
+
+    #[test]
+    fn with_selection_disabled_a_drag_selects_and_copies_nothing() {
+        run_on_big_stack(|| {
+            let (selected, plain) = drag_and_copy(false);
+            assert!(!selected, "selection is off, so nothing is selected");
+            assert!(plain.is_empty(), "and nothing would be copied, got {plain:?}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod html_copy_tests {
+    use super::*;
+
+    fn unit_with(parts: &[(CharStyle, &str)]) -> Unit {
+        let mut plain = String::new();
+        let mut styles = Vec::new();
+        for (style, text) in parts {
+            for _ in text.chars() {
+                styles.push(*style);
+            }
+            plain.push_str(text);
+        }
+        Unit {
+            markdown: plain.clone(),
+            md_map: (0..=plain.chars().count()).collect(),
+            plain,
+            styles,
+            kind: UnitKind::Block,
+        }
+    }
+
+    const PLAIN: CharStyle = CharStyle {
+        bold: false,
+        italic: false,
+        strike: false,
+        code: false,
+        link: false,
+    };
+    const BOLD: CharStyle = CharStyle {
+        bold: true,
+        ..CharStyle {
+            bold: false,
+            italic: false,
+            strike: false,
+            code: false,
+            link: false,
+        }
+    };
+    const ITALIC: CharStyle = CharStyle {
+        bold: false,
+        italic: true,
+        strike: false,
+        code: false,
+        link: false,
+    };
+    const CODE: CharStyle = CharStyle {
+        bold: false,
+        italic: false,
+        strike: false,
+        code: true,
+        link: false,
+    };
+
+    fn whole(u: Unit) -> String {
+        let len = u.plain.chars().count();
+        html_runs(&u, 0, len)
+    }
+
+    #[test]
+    fn plain_text_gets_no_tags() {
+        assert_eq!(whole(unit_with(&[(PLAIN, "hello")])), "hello");
+    }
+
+    #[test]
+    fn bold_and_italic_become_tags() {
+        assert_eq!(whole(unit_with(&[(BOLD, "bold")])), "<b>bold</b>");
+        assert_eq!(whole(unit_with(&[(ITALIC, "it")])), "<i>it</i>");
+    }
+
+    #[test]
+    fn code_becomes_a_code_tag() {
+        assert_eq!(whole(unit_with(&[(CODE, "x = 1")])), "<code>x = 1</code>");
+    }
+
+    #[test]
+    fn mixed_runs_are_tagged_separately() {
+        let u = unit_with(&[(PLAIN, "a "), (BOLD, "b"), (PLAIN, " c")]);
+        assert_eq!(whole(u), "a <b>b</b> c");
+    }
+
+    #[test]
+    fn html_special_characters_are_escaped() {
+        let u = unit_with(&[(PLAIN, "a < b & c > d")]);
+        assert_eq!(whole(u), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn a_partial_selection_is_sliced() {
+        let u = unit_with(&[(PLAIN, "abcdef")]);
+        assert_eq!(html_runs(&u, 2, 4), "cd");
+    }
+
+    #[test]
+    fn bold_mixed_with_italic_nests_in_order() {
+        let both = CharStyle {
+            bold: true,
+            italic: true,
+            strike: false,
+            code: false,
+            link: false,
+        };
+        // Tag order between nested bold and italic is presentational, so
+        // assert the meaning: the text is wrapped in both, properly balanced.
+        let html = whole(unit_with(&[(both, "x")]));
+        assert!(html.contains('x'));
+        assert!(html.contains("<b>") && html.contains("</b>"));
+        assert!(html.contains("<i>") && html.contains("</i>"));
+        assert!(html.starts_with('<') && html.ends_with('>'));
+        assert_eq!(html.matches('<').count(), html.matches('>').count());
+    }
 }

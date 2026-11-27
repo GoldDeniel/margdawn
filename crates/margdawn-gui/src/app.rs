@@ -9,10 +9,11 @@ use margdawn_core::config::{self, Config};
 use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
+use crate::clipboard_html;
 use crate::emoji::EmojiStore;
 use crate::editor::{save_text, SyntaxStyle};
 use crate::images::ImageStore;
-use crate::md_view::{RenderCfg, View};
+use crate::md_view::{RenderCfg, Selection, View};
 
 /// An action held back because the buffer has unsaved changes.
 #[derive(Debug, Clone)]
@@ -65,6 +66,85 @@ pub struct App {
     /// doesn't throw the reader back to the top
     view_offset: f32,
     restore_offset: Option<f32>,
+    /// mouse text selection in the rendered view, carried across frames so a
+    /// drag survives a scroll or a re-render
+    selection: Selection,
+    /// Kinetic scrolling for wheel/trackpad input. egui applies a wheel delta
+    /// and then stops dead the moment the fingers lift; this carries the
+    /// last observed speed forward, decaying it, so a fast flick coasts.
+    momentum: Momentum,
+    /// Offset an in-flight coast wants applied on the next frame.
+    pending_scroll: Option<f32>,
+    /// How this desktop can carry HTML on the clipboard, detected once at
+    /// startup because probing costs a process spawn.
+    rich_clipboard: clipboard_html::RichClipboard,
+}
+
+/// Velocity carried past the end of a scroll gesture.
+///
+/// egui's scroll area has no momentum for wheel input (only for pointer
+/// drags), so a flick stops dead on release. This tracks how fast the offset
+/// was moving while input was arriving and, once input stops, keeps moving it
+/// with friction until it settles.
+#[derive(Debug, Default)]
+pub struct Momentum {
+    /// Points per second, in scroll-offset space (positive = downwards).
+    velocity: f32,
+    /// Offset seen in the previous frame, or `None` on the first frame.
+    last_offset: Option<f32>,
+    /// Whether input was scrolling in the frame just measured.
+    was_scrolling: bool,
+}
+
+impl Momentum {
+    /// Pixels per second below which the coast is over.
+    const STOP_SPEED: f32 = 18.0;
+    /// Deceleration, in pixels per second squared. Higher stops sooner.
+    const FRICTION: f32 = 900.0;
+    /// A flick slower than this is a deliberate, careful scroll: no coast.
+    const MIN_FLICK: f32 = 60.0;
+    /// Cap, so a violent flick cannot rocket the page away.
+    const MAX_SPEED: f32 = 6000.0;
+
+    /// Record this frame's movement and return the offset to force next frame,
+    /// if a coast is in progress.
+    fn observe(&mut self, offset: f32, dt: f32, scrolling_now: bool) -> Option<f32> {
+        let mut coast = None;
+        if dt > 0.0 {
+            if let Some(prev) = self.last_offset {
+                let delta = offset - prev;
+                if scrolling_now && delta.abs() > 0.0 {
+                    // Follow the live speed. Clamped so a layout jump cannot be
+                    // mistaken for a violent flick.
+                    let measured = (delta / dt).clamp(-Self::MAX_SPEED, Self::MAX_SPEED);
+                    self.velocity = measured;
+                } else if !scrolling_now {
+                    if self.was_scrolling && self.velocity.abs() < Self::MIN_FLICK {
+                        // A careful scroll stops exactly where it was let go.
+                        self.velocity = 0.0;
+                    } else if self.velocity != 0.0 {
+                        // Coasting: bleed speed, then move. This also runs on the
+                        // frame the input stops, so the flick carries straight on
+                        // instead of losing one frame's worth of motion.
+                        let friction = Self::FRICTION * dt;
+                        if self.velocity.abs() <= Self::STOP_SPEED + friction {
+                            self.velocity = 0.0;
+                        } else {
+                            self.velocity -= friction * self.velocity.signum();
+                            coast = Some(offset + self.velocity * dt);
+                        }
+                    }
+                }
+            }
+        }
+        self.last_offset = Some(offset);
+        self.was_scrolling = scrolling_now;
+        coast
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl App {
@@ -101,6 +181,10 @@ impl App {
             save_error: None,
             view_offset: 0.0,
             restore_offset: None,
+            selection: Selection::default(),
+            momentum: Momentum::default(),
+            pending_scroll: None,
+            rich_clipboard: clipboard_html::RichClipboard::new(),
             cfg,
         };
         if std::env::var_os("MARGDAWN_SETTINGS").is_some() {
@@ -528,6 +612,39 @@ impl eframe::App for App {
         if ctrl_e && !self.confirm.is_some() {
             self.toggle_edit();
         }
+        // Select the whole document, so a reader can copy it in one go.
+        let ctrl_a = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A));
+        if ctrl_a && !self.editing && self.cfg.selectable_text() {
+            self.selection.select_all();
+        }
+        // ---- copy the view selection -----------------------------------------
+        // Handled here, before any panel runs, rather than inside the scroll
+        // area: the copy shortcut belongs to the window, and reading it at the
+        // top of the frame means no widget or scroll area can swallow it first.
+        if !self.editing && self.cfg.selectable_text() && self.selection.has_selection() {
+            let (copy_event, shift_c) = ctx.input(|i| {
+                let copy = i
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+                let shift_c =
+                    i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C);
+                (copy, shift_c)
+            });
+            if shift_c {
+                // Rich copy: put HTML *and* plain text on the clipboard, so a
+                // word processor keeps the formatting while a plain editor
+                // still gets readable text. egui can only carry plain text, so
+                // the HTML flavour goes through the desktop's clipboard tool;
+                // if that is unavailable, fall back to the Markdown source,
+                // which at least survives a Markdown-aware destination.
+                self.copy_selection_rich(ctx);
+            } else if copy_event {
+                if let Some(text) = self.selection.plain_text() {
+                    ctx.copy_text(text);
+                }
+            }
+        }
 
         // ---- top bar --------------------------------------------------------
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -609,8 +726,19 @@ impl eframe::App for App {
                             self.show_editor(ui);
                         } else {
                             let mut area = egui::ScrollArea::vertical()
-                                .auto_shrink([false, false]);
+                                .auto_shrink([false, false])
+                                // Dragging in the document selects text, so the
+                                // scroll area must not also claim the drag for
+                                // "drag to scroll" (its default). Otherwise the
+                                // area steals every drag before the text units
+                                // see it and nothing can ever be selected.
+                                .drag_to_scroll(!self.cfg.selectable_text());
                             if let Some(y) = self.restore_offset.take() {
+                                area = area.vertical_scroll_offset(y);
+                            }
+                            // A coast in progress overrides where the area
+                            // would otherwise land this frame.
+                            if let Some(y) = self.pending_scroll.take() {
                                 area = area.vertical_scroll_offset(y);
                             }
                             let out = area.show(ui, |ui| {
@@ -621,9 +749,10 @@ impl eframe::App for App {
                                     Rc::clone(&self.images),
                                     self.base_dir.clone(),
                                 );
-                                view.render_document(ui, doc);
+                                view.render_document(ui, doc, &mut self.selection);
                             });
                             self.view_offset = out.state.offset.y;
+                            self.feed_momentum(ctx, out.state.offset.y, out.content_size.y, out.inner_rect.height());
                         }
                     }
                 }
@@ -650,6 +779,59 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Copy the current selection with formatting, for a paste into a word
+    /// processor.
+    ///
+    /// `set_html` publishes HTML *and* a plain-text fallback in one clipboard
+    /// ownership. `ctx.copy_text` must never follow it: taking clipboard
+    /// ownership again replaces the offer with plain text and the HTML flavour
+    /// simply disappears, which is what a word processor reads as "no
+    /// formatting". Returns whether the rich flavour was stored.
+    fn copy_selection_rich(&mut self, ctx: &egui::Context) -> bool {
+        let (Some(plain), Some(html)) = (self.selection.plain_text(), self.selection.html())
+        else {
+            return false;
+        };
+        if self.rich_clipboard.set_html(&html, &plain) {
+            // Do NOT touch ctx.copy_text here. egui-winit republishes
+            // `copied_text` whenever it is non-empty, and publishing plain text
+            // takes clipboard ownership back, dropping the HTML flavour. The
+            // absence of a copy_text call is what keeps the rich offer alive.
+            let _ = ctx;
+            return true;
+        }
+        // No rich clipboard: fall back to the Markdown source, which at least
+        // survives a Markdown-aware destination.
+        if let Some(md) = self.selection.markdown_text() {
+            ctx.copy_text(md);
+        }
+        false
+    }
+
+    /// Continue a fast flick after the fingers lift.
+    ///
+    /// egui applies whatever wheel delta arrived this frame and then stops; it
+    /// carries no speed into the next frame. Watching the offset gives that
+    /// speed, and holding it here lets the page coast to a stop instead of
+    /// braking the instant the gesture ends.
+    fn feed_momentum(&mut self, ctx: &egui::Context, offset: f32, content_h: f32, view_h: f32) {
+        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.1);
+        // "Input is arriving" means a wheel or scroll event landed this frame.
+        let scrolling_now = ctx.input(|i| i.raw_scroll_delta.y != 0.0);
+        let max_offset = (content_h - view_h).max(0.0);
+
+        if let Some(next) = self.momentum.observe(offset, dt, scrolling_now) {
+            let clamped = next.clamp(0.0, max_offset);
+            if (clamped - offset).abs() > 0.01 {
+                self.pending_scroll = Some(clamped);
+                ctx.request_repaint();
+            } else {
+                // Hit the top or bottom: the coast is over.
+                self.momentum.reset();
+            }
+        }
+    }
+
     /// The edit pane: the raw source, styled as source.
     ///
     /// A plain `TextEdit` over the real bytes — the layouter only changes how
@@ -856,6 +1038,25 @@ impl App {
                     self.cfg.preserve_blank_lines = Some(pb);
                     changed = true;
                 }
+
+                // ---- selection
+                ui.add_space(8.0);
+                ui.heading("Selection");
+                ui.add_space(2.0);
+                let mut sel_text = self.cfg.selectable_text();
+                if ui
+                    .checkbox(&mut sel_text, "Select and copy text in the view")
+                    .changed()
+                {
+                    self.cfg.selectable_text = Some(sel_text);
+                    if !sel_text {
+                        self.selection.clear();
+                    }
+                    changed = true;
+                }
+                ui.add_enabled_ui(sel_text, |ui| {
+                    ui.weak("Ctrl+C copies plain text · Ctrl+Shift+C keeps Markdown markers");
+                });
 
                 // ---- images
                 ui.add_space(8.0);
@@ -1088,4 +1289,239 @@ fn save_png(path: &Path, img: &egui::ColorImage) -> Result<(), String> {
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
     let data: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
     writer.write_image_data(&data).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod copy_shortcut_tests {
+    use eframe::egui;
+    use crate::md_view::Selection;
+
+    /// The copy shortcut is read at the top of the frame, from the window's own
+    /// input, so it cannot be swallowed by a widget drawn later. This pins the
+    /// decision: which events copy, and in which format.
+    fn decide(events: &[egui::Event], mods: egui::Modifiers, c_pressed: bool) -> (bool, bool) {
+        let copy = events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+        let shift_c = mods.ctrl && mods.shift && c_pressed;
+        (copy || shift_c, shift_c)
+    }
+
+    #[test]
+    fn a_plain_copy_event_copies_plain_text() {
+        let (wants, markdown) = decide(&[egui::Event::Copy], egui::Modifiers::CTRL, false);
+        assert!(wants);
+        assert!(!markdown, "Ctrl+C keeps the readable text, not the markup");
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_markdown() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let (wants, markdown) = decide(&[], mods, true);
+        assert!(wants);
+        assert!(markdown, "Ctrl+Shift+C keeps the Markdown markers");
+    }
+
+    #[test]
+    fn a_stray_shift_does_not_flip_a_plain_copy_to_markdown() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        // Shift is held but no C press: a plain Event::Copy still means plain.
+        let (wants, markdown) = decide(&[egui::Event::Copy], mods, false);
+        assert!(wants);
+        assert!(!markdown);
+    }
+
+    #[test]
+    fn nothing_is_copied_without_an_event() {
+        assert_eq!(decide(&[], egui::Modifiers::NONE, false), (false, false));
+    }
+
+    /// The selection must survive the frame that paints it, or copy has nothing
+    /// to read. This is the contract `App::update` relies on.
+    #[test]
+    fn a_selection_has_text_to_copy() {
+        let sel = Selection::default();
+        assert!(!sel.has_selection());
+        assert_eq!(sel.plain_text(), None);
+        assert_eq!(sel.markdown_text(), None);
+    }
+}
+
+#[cfg(test)]
+mod momentum_tests {
+    use super::Momentum;
+
+    /// Feed a gesture: `frames` frames each moving `per_frame`, then stop.
+    /// Returns where the offset ended up and how many frames it took to settle.
+    fn flick(per_frame: f32, frames: usize) -> (f32, usize) {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        let mut offset = 0.0f32;
+        for _ in 0..frames {
+            offset += per_frame;
+            m.observe(offset, dt, true);
+        }
+        // Now coast until it stops.
+        let mut coast_frames = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    offset = next;
+                    coast_frames += 1;
+                    if coast_frames > 10_000 {
+                        panic!("never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        (offset, coast_frames)
+    }
+
+    #[test]
+    fn a_fast_flick_coasts_past_where_it_was_released() {
+        let (end, coast) = flick(-40.0, 6);
+        assert!(end < -240.0, "coasted beyond the 240px of real movement, got {end}");
+        assert!(coast > 5, "coast lasted several frames, got {coast}");
+    }
+
+    #[test]
+    fn a_gentle_scroll_does_not_coast() {
+        // Well under MIN_FLICK per second (1px/frame = 60px/s).
+        let (end, coast) = flick(-1.0, 10);
+        assert_eq!(coast, 0, "a careful scroll must not run away");
+        assert!((end + 10.0).abs() < 0.001, "stops exactly where it was, got {end}");
+    }
+
+    #[test]
+    fn the_coast_decays_and_ends() {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        let mut offset = 0.0f32;
+        for _ in 0..6 {
+            offset -= 40.0;
+            m.observe(offset, dt, true);
+        }
+        let mut speeds = Vec::new();
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    speeds.push((next - offset).abs());
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert!(speeds.len() > 3);
+        // Strictly slowing down, frame by frame.
+        for w in speeds.windows(2) {
+            assert!(w[1] <= w[0] + 0.001, "speed must decay, got {speeds:?}");
+        }
+        assert!(*speeds.last().unwrap() < *speeds.first().unwrap());
+    }
+
+    #[test]
+    fn downwards_flicks_coast_downwards_too() {
+        let (end, coast) = flick(40.0, 6);
+        assert!(end > 240.0, "got {end}");
+        assert!(coast > 5);
+    }
+
+    #[test]
+    fn a_violent_flick_cannot_exceed_the_speed_cap() {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        m.observe(0.0, dt, true);
+        // 100 000 px in one frame: absurd, must be clamped.
+        m.observe(-100_000.0, dt, true);
+        // Keep coasting for one frame and see the step size.
+        let step = m.observe(-100_000.0, dt, false).unwrap() - (-100_000.0);
+        assert!(step.abs() < Momentum::MAX_SPEED / 60.0 + 1.0, "step {step} too large");
+    }
+}
+
+#[cfg(test)]
+mod scroll_wiring_tests {
+    use super::Momentum;
+
+    /// Drive a full gesture through the same call the app uses: wheel deltas
+    /// arrive (and move the offset), then stop. The offset must keep moving.
+    #[test]
+    fn a_wheel_flick_keeps_moving_after_the_last_event() {
+        let mut m = Momentum::default();
+        let dt = 1.0 / 60.0;
+        let mut offset = 0.0f32;
+        let content: f32 = 5000.0;
+        let view: f32 = 600.0;
+
+        // 8 frames of a fast trackpad flick.
+        for _ in 0..8 {
+            offset += 45.0;
+            let _ = m.observe(offset, dt, true);
+        }
+        let released_at = offset;
+
+        // Now the OS stops sending events; the app's coast loop takes over.
+        let mut frames = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    let clamped = next.clamp(0.0, (content - view).max(0.0));
+                    if (clamped - offset).abs() <= 0.01 {
+                        break;
+                    }
+                    offset = clamped;
+                    frames += 1;
+                    if frames > 5_000 {
+                        panic!("coast never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(offset > released_at, "kept scrolling after release: {} -> {}", released_at, offset);
+        assert!(frames >= 3, "coasted for several frames, got {frames}");
+    }
+
+    #[test]
+    fn the_coast_stops_at_the_bottom() {
+        let mut m = Momentum::default();
+        let dt = 1.0 / 60.0;
+        let content: f32 = 1000.0;
+        let view: f32 = 600.0;
+        let max = content - view;
+        let mut offset = 0.0f32;
+
+        for _ in 0..8 {
+            offset += 45.0;
+            let _ = m.observe(offset, dt, true);
+        }
+        let mut steps = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    let clamped = next.clamp(0.0, max);
+                    if (clamped - offset).abs() <= 0.01 {
+                        break;
+                    }
+                    offset = clamped;
+                    steps += 1;
+                    assert!(offset <= max + 0.001, "never past the bottom, got {offset}");
+                    if steps > 5_000 {
+                        panic!("never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(offset <= max + 0.001);
+    }
 }
