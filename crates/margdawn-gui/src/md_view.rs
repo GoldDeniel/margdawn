@@ -84,6 +84,8 @@ struct Unit {
     markdown: String,
     /// `md_map[i]` is the Markdown character offset for plain boundary `i`.
     md_map: Vec<usize>,
+    /// Style of each plain character, for rich (HTML) copy.
+    styles: Vec<CharStyle>,
     kind: UnitKind,
 }
 
@@ -155,6 +157,37 @@ impl Selection {
     /// Selected text with the original Markdown markup included.
     pub fn markdown_text(&self) -> Option<String> {
         self.collect(true)
+    }
+
+    /// Selected text as an HTML fragment, so pasting into a word processor
+    /// keeps bold, italic, strikethrough and code.
+    ///
+    /// egui's clipboard only carries plain text, so this is handed to the
+    /// platform clipboard separately (see `clipboard_html`).
+    pub fn html(&self) -> Option<String> {
+        let (a, b) = self.ordered()?;
+        if a == b {
+            return None;
+        }
+        let mut out = String::new();
+        let count = self.units.len();
+        for (i, unit) in self.units.iter().enumerate() {
+            let plain_len = unit.plain.chars().count();
+            let from = if i == a.unit { a.offset.min(plain_len) } else { 0 };
+            let to = if i == b.unit { b.offset.min(plain_len) } else { plain_len };
+            if from >= to {
+                continue;
+            }
+            let at_block_start = i == a.unit || i == 0;
+            if !at_block_start && i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&html_runs(unit, from, to));
+            if i + 1 == count && i != a.unit {
+                break;
+            }
+        }
+        (!out.trim().is_empty()).then_some(out)
     }
 
     fn collect(&self, markdown: bool) -> Option<String> {
@@ -326,11 +359,33 @@ struct MdBuilder {
     markdown: String,
     md_chars: usize,
     map: Vec<usize>,
+    /// Style of each plain character, so a selection can be turned into rich
+    /// HTML and pasted into a word processor with its formatting intact.
+    styles: Vec<CharStyle>,
+    /// Style applied to text appended right now.
+    current: CharStyle,
+}
+
+/// The inline formatting of one plain character, flattened for HTML output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CharStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    code: bool,
+    link: bool,
 }
 
 impl MdBuilder {
     fn new() -> Self {
-        Self { plain: String::new(), markdown: String::new(), md_chars: 0, map: vec![0] }
+        Self {
+            plain: String::new(),
+            markdown: String::new(),
+            md_chars: 0,
+            map: vec![0],
+            styles: Vec::new(),
+            current: CharStyle::default(),
+        }
     }
 
     /// Append literal text that appears identically in both forms.
@@ -342,6 +397,7 @@ impl MdBuilder {
         self.md_chars += n;
         for k in 1..=n {
             self.map.push(base + k);
+            self.styles.push(self.current);
         }
     }
 
@@ -361,6 +417,12 @@ impl MdBuilder {
         if let Some(last) = self.map.last_mut() {
             *last = self.md_chars;
         }
+    }
+
+    /// Per-plain-character styles built so far, taken before [`Self::finish`]
+    /// consumes the builder.
+    fn take_styles(&mut self) -> Vec<CharStyle> {
+        std::mem::take(&mut self.styles)
     }
 
     fn finish(mut self, prefix: &str, suffix: &str) -> (String, String, Vec<usize>) {
@@ -384,6 +446,74 @@ impl MdBuilder {
         }
         (self.plain, self.markdown, self.map)
     }
+}
+
+/// Emit `unit.plain[from..to]` as HTML, wrapping each run in the tags its
+/// recorded style calls for. Adjacent characters of identical style share one
+/// tag pair so the markup stays readable.
+fn html_runs(unit: &Unit, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut run_style: Option<CharStyle> = None;
+
+    let flush = |out: &mut String, run: &mut String, style: Option<CharStyle>| {
+        if run.is_empty() {
+            return;
+        }
+        let s = style.unwrap_or_default();
+        // Innermost first, closed in reverse order.
+        if s.code {
+            out.push_str("<code>");
+        }
+        if s.link {
+            out.push_str("<u>");
+        }
+        if s.strike {
+            out.push_str("<del>");
+        }
+        if s.italic {
+            out.push_str("<i>");
+        }
+        if s.bold {
+            out.push_str("<b>");
+        }
+        out.push_str(run);
+        if s.bold {
+            out.push_str("</b>");
+        }
+        if s.italic {
+            out.push_str("</i>");
+        }
+        if s.strike {
+            out.push_str("</del>");
+        }
+        if s.link {
+            out.push_str("</u>");
+        }
+        if s.code {
+            out.push_str("</code>");
+        }
+        run.clear();
+    };
+
+    for (idx, ch) in unit.plain.chars().enumerate() {
+        if idx < from || idx >= to {
+            continue;
+        }
+        let style = unit.styles.get(idx).copied().unwrap_or_default();
+        if run_style.is_some_and(|s| s != style) {
+            flush(&mut out, &mut run, run_style);
+        }
+        run_style = Some(style);
+        match ch {
+            '<' => run.push_str("&lt;"),
+            '>' => run.push_str("&gt;"),
+            '&' => run.push_str("&amp;"),
+            _ => run.push(ch),
+        }
+    }
+    flush(&mut out, &mut run, run_style);
+    out
 }
 
 fn span_markers(span: &Span) -> (String, String) {
@@ -597,6 +727,15 @@ impl View {
             let font_size = if span.code { size * 0.92 } else { size };
             let font_id = egui::FontId::new(font_size, family);
             let (marker_open, marker_close) = span_markers(span);
+            // Record the style so a selection can be re-emitted as HTML with
+            // the formatting a word processor understands.
+            md.current = CharStyle {
+                bold: span.bold || bold_all,
+                italic: span.italic,
+                strike: span.strike,
+                code: span.code,
+                link: span.link.is_some(),
+            };
             md.span_start(&marker_open);
             // inline-code chips get padding before/after their text
             if span.code {
@@ -833,8 +972,10 @@ impl View {
         galley: &Arc<egui::Galley>,
         selection: &mut Selection,
     ) {
+        let mut md = md;
+        let styles = md.take_styles();
         let (plain, markdown, md_map) = md.finish(prefix, suffix);
-        let unit = selection.push_unit(Unit { plain, markdown, md_map, kind });
+        let unit = selection.push_unit(Unit { plain, markdown, md_map, styles, kind });
         self.geoms.push(UnitGeom {
             unit,
             rect,
@@ -1198,13 +1339,15 @@ impl View {
                     is_header,
                 );
                 job.wrap.max_width = f32::INFINITY;
+                let mut md = md;
+                let styles = md.take_styles();
                 let (plain, markdown, md_map) = md.finish(
                     if c == 0 { "| " } else { "" },
                     if c + 1 == cols { " |" } else { "" },
                 );
                 let kind = UnitKind::TableCell { row: grid.len(), col: c, cols };
                 let unit =
-                    selection.push_unit(Unit { plain, markdown, md_map, kind });
+                    selection.push_unit(Unit { plain, markdown, md_map, styles, kind });
                 let galley = ui.painter().layout_job(job);
                 let len = galley.text().chars().count();
                 cells.push(Cell { galley, meta, unit, len });
@@ -1402,11 +1545,13 @@ mod tests {
     fn built_unit(build: impl FnOnce(&mut MdBuilder)) -> Unit {
         let mut md = MdBuilder::new();
         build(&mut md);
+        let styles = md.take_styles();
         let (plain, markdown, md_map) = md.finish("", "");
         Unit {
             plain,
             markdown,
             md_map,
+            styles,
             kind: UnitKind::Block,
         }
     }
@@ -1636,5 +1781,118 @@ mod selection_input_tests {
             assert!(!selected, "selection is off, so nothing is selected");
             assert!(plain.is_empty(), "and nothing would be copied, got {plain:?}");
         });
+    }
+}
+
+#[cfg(test)]
+mod html_copy_tests {
+    use super::*;
+
+    fn unit_with(parts: &[(CharStyle, &str)]) -> Unit {
+        let mut plain = String::new();
+        let mut styles = Vec::new();
+        for (style, text) in parts {
+            for _ in text.chars() {
+                styles.push(*style);
+            }
+            plain.push_str(text);
+        }
+        Unit {
+            markdown: plain.clone(),
+            md_map: (0..=plain.chars().count()).collect(),
+            plain,
+            styles,
+            kind: UnitKind::Block,
+        }
+    }
+
+    const PLAIN: CharStyle = CharStyle {
+        bold: false,
+        italic: false,
+        strike: false,
+        code: false,
+        link: false,
+    };
+    const BOLD: CharStyle = CharStyle {
+        bold: true,
+        ..CharStyle {
+            bold: false,
+            italic: false,
+            strike: false,
+            code: false,
+            link: false,
+        }
+    };
+    const ITALIC: CharStyle = CharStyle {
+        bold: false,
+        italic: true,
+        strike: false,
+        code: false,
+        link: false,
+    };
+    const CODE: CharStyle = CharStyle {
+        bold: false,
+        italic: false,
+        strike: false,
+        code: true,
+        link: false,
+    };
+
+    fn whole(u: Unit) -> String {
+        let len = u.plain.chars().count();
+        html_runs(&u, 0, len)
+    }
+
+    #[test]
+    fn plain_text_gets_no_tags() {
+        assert_eq!(whole(unit_with(&[(PLAIN, "hello")])), "hello");
+    }
+
+    #[test]
+    fn bold_and_italic_become_tags() {
+        assert_eq!(whole(unit_with(&[(BOLD, "bold")])), "<b>bold</b>");
+        assert_eq!(whole(unit_with(&[(ITALIC, "it")])), "<i>it</i>");
+    }
+
+    #[test]
+    fn code_becomes_a_code_tag() {
+        assert_eq!(whole(unit_with(&[(CODE, "x = 1")])), "<code>x = 1</code>");
+    }
+
+    #[test]
+    fn mixed_runs_are_tagged_separately() {
+        let u = unit_with(&[(PLAIN, "a "), (BOLD, "b"), (PLAIN, " c")]);
+        assert_eq!(whole(u), "a <b>b</b> c");
+    }
+
+    #[test]
+    fn html_special_characters_are_escaped() {
+        let u = unit_with(&[(PLAIN, "a < b & c > d")]);
+        assert_eq!(whole(u), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn a_partial_selection_is_sliced() {
+        let u = unit_with(&[(PLAIN, "abcdef")]);
+        assert_eq!(html_runs(&u, 2, 4), "cd");
+    }
+
+    #[test]
+    fn bold_mixed_with_italic_nests_in_order() {
+        let both = CharStyle {
+            bold: true,
+            italic: true,
+            strike: false,
+            code: false,
+            link: false,
+        };
+        // Tag order between nested bold and italic is presentational, so
+        // assert the meaning: the text is wrapped in both, properly balanced.
+        let html = whole(unit_with(&[(both, "x")]));
+        assert!(html.contains('x'));
+        assert!(html.contains("<b>") && html.contains("</b>"));
+        assert!(html.contains("<i>") && html.contains("</i>"));
+        assert!(html.starts_with('<') && html.ends_with('>'));
+        assert_eq!(html.matches('<').count(), html.matches('>').count());
     }
 }

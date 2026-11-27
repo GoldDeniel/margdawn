@@ -9,6 +9,7 @@ use margdawn_core::config::{self, Config};
 use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
+use crate::clipboard_html;
 use crate::emoji::EmojiStore;
 use crate::editor::{save_text, SyntaxStyle};
 use crate::images::ImageStore;
@@ -74,6 +75,9 @@ pub struct App {
     momentum: Momentum,
     /// Offset an in-flight coast wants applied on the next frame.
     pending_scroll: Option<f32>,
+    /// How this desktop can carry HTML on the clipboard, detected once at
+    /// startup because probing costs a process spawn.
+    rich_clipboard: clipboard_html::RichClipboard,
 }
 
 /// Velocity carried past the end of a scroll gesture.
@@ -180,6 +184,7 @@ impl App {
             selection: Selection::default(),
             momentum: Momentum::default(),
             pending_scroll: None,
+            rich_clipboard: clipboard_html::RichClipboard::new(),
             cfg,
         };
         if std::env::var_os("MARGDAWN_SETTINGS").is_some() {
@@ -622,8 +627,33 @@ impl eframe::App for App {
                 (copy, shift_c)
             });
             if shift_c {
-                if let Some(text) = self.selection.markdown_text() {
-                    ctx.copy_text(text);
+                // Rich copy: put HTML *and* plain text on the clipboard, so a
+                // word processor keeps the formatting while a plain editor
+                // still gets readable text. egui can only carry plain text, so
+                // the HTML flavour goes through the desktop's clipboard tool;
+                // if that is unavailable, fall back to the Markdown source,
+                // which at least survives a Markdown-aware destination.
+                let plain = self.selection.plain_text();
+                let html = self.selection.html();
+                let mut stored_rich = false;
+                if let (Some(html), Some(plain)) = (html.as_deref(), plain.as_deref()) {
+                    // Only attempt the rich path when the clipboard can take
+                    // it; `set_html` reports failure rather than lying.
+                    if self.rich_clipboard.available() {
+                        stored_rich = self.rich_clipboard.set_html(html, plain);
+                    }
+                }
+                if let Some(plain) = plain {
+                    // Keep egui's own copy in sync: it is what a plain editor
+                    // or the next Ctrl+C in another app will read.
+                    ctx.copy_text(plain);
+                }
+                if !stored_rich {
+                    // No rich flavour: leave the Markdown source on the
+                    // clipboard so Ctrl+Shift+C still means "the original".
+                    if let Some(md) = self.selection.markdown_text() {
+                        ctx.copy_text(md);
+                    }
                 }
             } else if copy_event {
                 if let Some(text) = self.selection.plain_text() {
