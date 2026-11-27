@@ -52,6 +52,9 @@ pub struct Config {
     /// Unset = images use their natural size (capped to the available width).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_max_width_percent: Option<f32>,
+    /// GUI: allow selecting text in the rendered view (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selectable_text: Option<bool>,
 }
 
 pub const DEFAULT_FONT_SIZE: f32 = 15.0;
@@ -115,6 +118,11 @@ impl Config {
     /// GUI: forced max image width percentage, if enabled.
     pub fn image_max_width_percent(&self) -> Option<f32> {
         self.image_max_width_percent.map(|p| p.clamp(5.0, 100.0))
+    }
+
+    /// GUI: allow selecting and copying text in the rendered view (default on).
+    pub fn selectable_text(&self) -> bool {
+        self.selectable_text.unwrap_or(true)
     }
 }
 
@@ -289,5 +297,17 @@ mod tests {
         // it resolves, otherwise we still always get some theme.
         let r = resolve_theme(None);
         assert!(!Arc::clone(&r.theme).name().is_empty());
+    }
+
+    #[test]
+    fn selectable_text_defaults_on_and_parses_off() {
+        assert!(Config::default().selectable_text());
+        let c: Config = serde_json::from_str(r#"{"selectable_text": false}"#).unwrap();
+        assert!(!c.selectable_text());
+        let c: Config = serde_json::from_str(r#"{"selectable_text": true}"#).unwrap();
+        assert!(c.selectable_text());
+        // omitted value must stay omitted when written back
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!json.contains("selectable_text"));
     }
 }

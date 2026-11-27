@@ -10,9 +10,9 @@ use margdawn_core::md::{parse, Document};
 use margdawn_core::theme::{self, Color, ColorKey, Theme};
 
 use crate::emoji::EmojiStore;
-use crate::editor::{highlight, save_text, SyntaxStyle};
+use crate::editor::{save_text, SyntaxStyle};
 use crate::images::ImageStore;
-use crate::md_view::{RenderCfg, View};
+use crate::md_view::{RenderCfg, Selection, View};
 
 /// An action held back because the buffer has unsaved changes.
 #[derive(Debug, Clone)]
@@ -65,6 +65,9 @@ pub struct App {
     /// doesn't throw the reader back to the top
     view_offset: f32,
     restore_offset: Option<f32>,
+    /// mouse text selection in the rendered view, carried across frames so a
+    /// drag survives a scroll or a re-render
+    selection: Selection,
 }
 
 impl App {
@@ -101,6 +104,7 @@ impl App {
             save_error: None,
             view_offset: 0.0,
             restore_offset: None,
+            selection: Selection::default(),
             cfg,
         };
         if std::env::var_os("MARGDAWN_SETTINGS").is_some() {
@@ -621,7 +625,7 @@ impl eframe::App for App {
                                     Rc::clone(&self.images),
                                     self.base_dir.clone(),
                                 );
-                                view.render_document(ui, doc);
+                                view.render_document(ui, doc, &mut self.selection);
                             });
                             self.view_offset = out.state.offset.y;
                         }
@@ -679,25 +683,13 @@ impl App {
             return;
         };
 
-        let mut layouter =
-            |ui: &egui::Ui, text: &str, wrap_width: f32| -> std::sync::Arc<egui::Galley> {
-                let job = highlight(text, &st, wrap_width);
-                ui.fonts(|f| f.layout_job(job))
-            };
+        // Fill the window with the pane so the source has somewhere to be, then
+        // let it grow past the viewport when the document is longer.
+        let row_height = ui.fonts(|f| f.row_height(&st.font));
+        let min_rows = ((ui.available_height() / row_height).ceil() as usize).max(1);
 
-        let edit = egui::TextEdit::multiline(src)
-            .desired_width(f32::INFINITY)
-            .desired_rows(24)
-            .frame(false)
-            .margin(egui::Margin::same(0.0))
-            .lock_focus(true)
-            .layouter(&mut layouter);
-
-        let resp = ui.add_sized(
-            [ui.available_width(), ui.available_height()],
-            edit,
-        );
-        if resp.changed() {
+        let out = crate::editor::source_editor(ui, src, &st, min_rows);
+        if out.response.changed() {
             self.file_dirty = true;
         }
     }
@@ -868,6 +860,25 @@ impl App {
                     self.cfg.preserve_blank_lines = Some(pb);
                     changed = true;
                 }
+
+                // ---- selection
+                ui.add_space(8.0);
+                ui.heading("Selection");
+                ui.add_space(2.0);
+                let mut sel_text = self.cfg.selectable_text();
+                if ui
+                    .checkbox(&mut sel_text, "Select and copy text in the view")
+                    .changed()
+                {
+                    self.cfg.selectable_text = Some(sel_text);
+                    if !sel_text {
+                        self.selection.clear();
+                    }
+                    changed = true;
+                }
+                ui.add_enabled_ui(sel_text, |ui| {
+                    ui.weak("Ctrl+C copies plain text · Ctrl+Shift+C keeps Markdown markers");
+                });
 
                 // ---- images
                 ui.add_space(8.0);
