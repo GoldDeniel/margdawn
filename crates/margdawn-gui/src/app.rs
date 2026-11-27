@@ -68,6 +68,79 @@ pub struct App {
     /// mouse text selection in the rendered view, carried across frames so a
     /// drag survives a scroll or a re-render
     selection: Selection,
+    /// Kinetic scrolling for wheel/trackpad input. egui applies a wheel delta
+    /// and then stops dead the moment the fingers lift; this carries the
+    /// last observed speed forward, decaying it, so a fast flick coasts.
+    momentum: Momentum,
+    /// Offset an in-flight coast wants applied on the next frame.
+    pending_scroll: Option<f32>,
+}
+
+/// Velocity carried past the end of a scroll gesture.
+///
+/// egui's scroll area has no momentum for wheel input (only for pointer
+/// drags), so a flick stops dead on release. This tracks how fast the offset
+/// was moving while input was arriving and, once input stops, keeps moving it
+/// with friction until it settles.
+#[derive(Debug, Default)]
+pub struct Momentum {
+    /// Points per second, in scroll-offset space (positive = downwards).
+    velocity: f32,
+    /// Offset seen in the previous frame, or `None` on the first frame.
+    last_offset: Option<f32>,
+    /// Whether input was scrolling in the frame just measured.
+    was_scrolling: bool,
+}
+
+impl Momentum {
+    /// Pixels per second below which the coast is over.
+    const STOP_SPEED: f32 = 18.0;
+    /// Deceleration, in pixels per second squared. Higher stops sooner.
+    const FRICTION: f32 = 900.0;
+    /// A flick slower than this is a deliberate, careful scroll: no coast.
+    const MIN_FLICK: f32 = 60.0;
+    /// Cap, so a violent flick cannot rocket the page away.
+    const MAX_SPEED: f32 = 6000.0;
+
+    /// Record this frame's movement and return the offset to force next frame,
+    /// if a coast is in progress.
+    fn observe(&mut self, offset: f32, dt: f32, scrolling_now: bool) -> Option<f32> {
+        let mut coast = None;
+        if dt > 0.0 {
+            if let Some(prev) = self.last_offset {
+                let delta = offset - prev;
+                if scrolling_now && delta.abs() > 0.0 {
+                    // Follow the live speed. Clamped so a layout jump cannot be
+                    // mistaken for a violent flick.
+                    let measured = (delta / dt).clamp(-Self::MAX_SPEED, Self::MAX_SPEED);
+                    self.velocity = measured;
+                } else if !scrolling_now {
+                    if self.was_scrolling && self.velocity.abs() < Self::MIN_FLICK {
+                        // A careful scroll stops exactly where it was let go.
+                        self.velocity = 0.0;
+                    } else if self.velocity != 0.0 {
+                        // Coasting: bleed speed, then move. This also runs on the
+                        // frame the input stops, so the flick carries straight on
+                        // instead of losing one frame's worth of motion.
+                        let friction = Self::FRICTION * dt;
+                        if self.velocity.abs() <= Self::STOP_SPEED + friction {
+                            self.velocity = 0.0;
+                        } else {
+                            self.velocity -= friction * self.velocity.signum();
+                            coast = Some(offset + self.velocity * dt);
+                        }
+                    }
+                }
+            }
+        }
+        self.last_offset = Some(offset);
+        self.was_scrolling = scrolling_now;
+        coast
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl App {
@@ -105,6 +178,8 @@ impl App {
             view_offset: 0.0,
             restore_offset: None,
             selection: Selection::default(),
+            momentum: Momentum::default(),
+            pending_scroll: None,
             cfg,
         };
         if std::env::var_os("MARGDAWN_SETTINGS").is_some() {
@@ -647,6 +722,11 @@ impl eframe::App for App {
                             if let Some(y) = self.restore_offset.take() {
                                 area = area.vertical_scroll_offset(y);
                             }
+                            // A coast in progress overrides where the area
+                            // would otherwise land this frame.
+                            if let Some(y) = self.pending_scroll.take() {
+                                area = area.vertical_scroll_offset(y);
+                            }
                             let out = area.show(ui, |ui| {
                                 let mut view = View::new(
                                     Arc::clone(&self.theme),
@@ -658,6 +738,7 @@ impl eframe::App for App {
                                 view.render_document(ui, doc, &mut self.selection);
                             });
                             self.view_offset = out.state.offset.y;
+                            self.feed_momentum(ctx, out.state.offset.y, out.content_size.y, out.inner_rect.height());
                         }
                     }
                 }
@@ -684,6 +765,30 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Continue a fast flick after the fingers lift.
+    ///
+    /// egui applies whatever wheel delta arrived this frame and then stops; it
+    /// carries no speed into the next frame. Watching the offset gives that
+    /// speed, and holding it here lets the page coast to a stop instead of
+    /// braking the instant the gesture ends.
+    fn feed_momentum(&mut self, ctx: &egui::Context, offset: f32, content_h: f32, view_h: f32) {
+        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.1);
+        // "Input is arriving" means a wheel or scroll event landed this frame.
+        let scrolling_now = ctx.input(|i| i.raw_scroll_delta.y != 0.0);
+        let max_offset = (content_h - view_h).max(0.0);
+
+        if let Some(next) = self.momentum.observe(offset, dt, scrolling_now) {
+            let clamped = next.clamp(0.0, max_offset);
+            if (clamped - offset).abs() > 0.01 {
+                self.pending_scroll = Some(clamped);
+                ctx.request_repaint();
+            } else {
+                // Hit the top or bottom: the coast is over.
+                self.momentum.reset();
+            }
+        }
+    }
+
     /// The edit pane: the raw source, styled as source.
     ///
     /// A plain `TextEdit` over the real bytes — the layouter only changes how
@@ -1204,5 +1309,176 @@ mod copy_shortcut_tests {
         assert!(!sel.has_selection());
         assert_eq!(sel.plain_text(), None);
         assert_eq!(sel.markdown_text(), None);
+    }
+}
+
+#[cfg(test)]
+mod momentum_tests {
+    use super::Momentum;
+
+    /// Feed a gesture: `frames` frames each moving `per_frame`, then stop.
+    /// Returns where the offset ended up and how many frames it took to settle.
+    fn flick(per_frame: f32, frames: usize) -> (f32, usize) {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        let mut offset = 0.0f32;
+        for _ in 0..frames {
+            offset += per_frame;
+            m.observe(offset, dt, true);
+        }
+        // Now coast until it stops.
+        let mut coast_frames = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    offset = next;
+                    coast_frames += 1;
+                    if coast_frames > 10_000 {
+                        panic!("never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        (offset, coast_frames)
+    }
+
+    #[test]
+    fn a_fast_flick_coasts_past_where_it_was_released() {
+        let (end, coast) = flick(-40.0, 6);
+        assert!(end < -240.0, "coasted beyond the 240px of real movement, got {end}");
+        assert!(coast > 5, "coast lasted several frames, got {coast}");
+    }
+
+    #[test]
+    fn a_gentle_scroll_does_not_coast() {
+        // Well under MIN_FLICK per second (1px/frame = 60px/s).
+        let (end, coast) = flick(-1.0, 10);
+        assert_eq!(coast, 0, "a careful scroll must not run away");
+        assert!((end + 10.0).abs() < 0.001, "stops exactly where it was, got {end}");
+    }
+
+    #[test]
+    fn the_coast_decays_and_ends() {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        let mut offset = 0.0f32;
+        for _ in 0..6 {
+            offset -= 40.0;
+            m.observe(offset, dt, true);
+        }
+        let mut speeds = Vec::new();
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    speeds.push((next - offset).abs());
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert!(speeds.len() > 3);
+        // Strictly slowing down, frame by frame.
+        for w in speeds.windows(2) {
+            assert!(w[1] <= w[0] + 0.001, "speed must decay, got {speeds:?}");
+        }
+        assert!(*speeds.last().unwrap() < *speeds.first().unwrap());
+    }
+
+    #[test]
+    fn downwards_flicks_coast_downwards_too() {
+        let (end, coast) = flick(40.0, 6);
+        assert!(end > 240.0, "got {end}");
+        assert!(coast > 5);
+    }
+
+    #[test]
+    fn a_violent_flick_cannot_exceed_the_speed_cap() {
+        let dt = 1.0 / 60.0;
+        let mut m = Momentum::default();
+        m.observe(0.0, dt, true);
+        // 100 000 px in one frame: absurd, must be clamped.
+        m.observe(-100_000.0, dt, true);
+        // Keep coasting for one frame and see the step size.
+        let step = m.observe(-100_000.0, dt, false).unwrap() - (-100_000.0);
+        assert!(step.abs() < Momentum::MAX_SPEED / 60.0 + 1.0, "step {step} too large");
+    }
+}
+
+#[cfg(test)]
+mod scroll_wiring_tests {
+    use super::Momentum;
+
+    /// Drive a full gesture through the same call the app uses: wheel deltas
+    /// arrive (and move the offset), then stop. The offset must keep moving.
+    #[test]
+    fn a_wheel_flick_keeps_moving_after_the_last_event() {
+        let mut m = Momentum::default();
+        let dt = 1.0 / 60.0;
+        let mut offset = 0.0f32;
+        let content: f32 = 5000.0;
+        let view: f32 = 600.0;
+
+        // 8 frames of a fast trackpad flick.
+        for _ in 0..8 {
+            offset += 45.0;
+            let _ = m.observe(offset, dt, true);
+        }
+        let released_at = offset;
+
+        // Now the OS stops sending events; the app's coast loop takes over.
+        let mut frames = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    let clamped = next.clamp(0.0, (content - view).max(0.0));
+                    if (clamped - offset).abs() <= 0.01 {
+                        break;
+                    }
+                    offset = clamped;
+                    frames += 1;
+                    if frames > 5_000 {
+                        panic!("coast never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(offset > released_at, "kept scrolling after release: {} -> {}", released_at, offset);
+        assert!(frames >= 3, "coasted for several frames, got {frames}");
+    }
+
+    #[test]
+    fn the_coast_stops_at_the_bottom() {
+        let mut m = Momentum::default();
+        let dt = 1.0 / 60.0;
+        let content: f32 = 1000.0;
+        let view: f32 = 600.0;
+        let max = content - view;
+        let mut offset = 0.0f32;
+
+        for _ in 0..8 {
+            offset += 45.0;
+            let _ = m.observe(offset, dt, true);
+        }
+        let mut steps = 0;
+        loop {
+            match m.observe(offset, dt, false) {
+                Some(next) => {
+                    let clamped = next.clamp(0.0, max);
+                    if (clamped - offset).abs() <= 0.01 {
+                        break;
+                    }
+                    offset = clamped;
+                    steps += 1;
+                    assert!(offset <= max + 0.001, "never past the bottom, got {offset}");
+                    if steps > 5_000 {
+                        panic!("never settled");
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(offset <= max + 0.001);
     }
 }
