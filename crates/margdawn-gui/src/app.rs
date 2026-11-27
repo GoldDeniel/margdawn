@@ -612,6 +612,11 @@ impl eframe::App for App {
         if ctrl_e && !self.confirm.is_some() {
             self.toggle_edit();
         }
+        // Select the whole document, so a reader can copy it in one go.
+        let ctrl_a = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A));
+        if ctrl_a && !self.editing && self.cfg.selectable_text() {
+            self.selection.select_all();
+        }
         // ---- copy the view selection -----------------------------------------
         // Handled here, before any panel runs, rather than inside the scroll
         // area: the copy shortcut belongs to the window, and reading it at the
@@ -633,28 +638,7 @@ impl eframe::App for App {
                 // the HTML flavour goes through the desktop's clipboard tool;
                 // if that is unavailable, fall back to the Markdown source,
                 // which at least survives a Markdown-aware destination.
-                let plain = self.selection.plain_text();
-                let html = self.selection.html();
-                let mut stored_rich = false;
-                if let (Some(html), Some(plain)) = (html.as_deref(), plain.as_deref()) {
-                    // Only attempt the rich path when the clipboard can take
-                    // it; `set_html` reports failure rather than lying.
-                    if self.rich_clipboard.available() {
-                        stored_rich = self.rich_clipboard.set_html(html, plain);
-                    }
-                }
-                if let Some(plain) = plain {
-                    // Keep egui's own copy in sync: it is what a plain editor
-                    // or the next Ctrl+C in another app will read.
-                    ctx.copy_text(plain);
-                }
-                if !stored_rich {
-                    // No rich flavour: leave the Markdown source on the
-                    // clipboard so Ctrl+Shift+C still means "the original".
-                    if let Some(md) = self.selection.markdown_text() {
-                        ctx.copy_text(md);
-                    }
-                }
+                self.copy_selection_rich(ctx);
             } else if copy_event {
                 if let Some(text) = self.selection.plain_text() {
                     ctx.copy_text(text);
@@ -795,6 +779,35 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Copy the current selection with formatting, for a paste into a word
+    /// processor.
+    ///
+    /// `set_html` publishes HTML *and* a plain-text fallback in one clipboard
+    /// ownership. `ctx.copy_text` must never follow it: taking clipboard
+    /// ownership again replaces the offer with plain text and the HTML flavour
+    /// simply disappears, which is what a word processor reads as "no
+    /// formatting". Returns whether the rich flavour was stored.
+    fn copy_selection_rich(&mut self, ctx: &egui::Context) -> bool {
+        let (Some(plain), Some(html)) = (self.selection.plain_text(), self.selection.html())
+        else {
+            return false;
+        };
+        if self.rich_clipboard.set_html(&html, &plain) {
+            // Do NOT touch ctx.copy_text here. egui-winit republishes
+            // `copied_text` whenever it is non-empty, and publishing plain text
+            // takes clipboard ownership back, dropping the HTML flavour. The
+            // absence of a copy_text call is what keeps the rich offer alive.
+            let _ = ctx;
+            return true;
+        }
+        // No rich clipboard: fall back to the Markdown source, which at least
+        // survives a Markdown-aware destination.
+        if let Some(md) = self.selection.markdown_text() {
+            ctx.copy_text(md);
+        }
+        false
+    }
+
     /// Continue a fast flick after the fingers lift.
     ///
     /// egui applies whatever wheel delta arrived this frame and then stops; it

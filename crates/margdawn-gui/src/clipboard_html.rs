@@ -28,14 +28,6 @@ impl RichClipboard {
         Self::default()
     }
 
-    /// Whether a rich copy is worth attempting at all.
-    ///
-    /// Opening the clipboard can fail (no seat, no compositor); a failure here
-    /// only means Ctrl+Shift+C falls back to copying the Markdown source.
-    pub fn available(&self) -> bool {
-        self.with(|_| ()).is_some()
-    }
-
     fn with<T>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
         let mut slot = self.inner.borrow_mut();
         if slot.is_none() {
@@ -80,7 +72,7 @@ mod tests {
     fn a_new_clipboard_can_be_constructed_without_panicking() {
         // Construction must never panic, even headless or without a seat.
         let cb = RichClipboard::new();
-        let _ = cb.available();
+        assert!(cb.inner.borrow().is_none(), "opens lazily");
     }
 
     #[test]

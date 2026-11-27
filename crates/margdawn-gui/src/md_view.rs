@@ -127,6 +127,22 @@ impl Selection {
         self.dragging = false;
     }
 
+    /// Select the whole rendered document.
+    ///
+    /// Used by `Ctrl+A` and by the developer self-test hook, which needs a
+    /// selection without a mouse.
+    pub fn select_all(&mut self) {
+        if self.units.is_empty() {
+            self.clear();
+            return;
+        }
+        self.anchor = Some(SelectionPos { unit: 0, offset: 0 });
+        let last = self.units.len() - 1;
+        let end = self.units[last].plain.chars().count();
+        self.cursor = Some(SelectionPos { unit: last, offset: end });
+        self.dragging = false;
+    }
+
     pub fn has_selection(&self) -> bool {
         self.ordered().is_some_and(|(a, b)| a != b)
     }
