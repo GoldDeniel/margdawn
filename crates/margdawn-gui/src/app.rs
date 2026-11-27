@@ -532,6 +532,30 @@ impl eframe::App for App {
         if ctrl_e && !self.confirm.is_some() {
             self.toggle_edit();
         }
+        // ---- copy the view selection -----------------------------------------
+        // Handled here, before any panel runs, rather than inside the scroll
+        // area: the copy shortcut belongs to the window, and reading it at the
+        // top of the frame means no widget or scroll area can swallow it first.
+        if !self.editing && self.cfg.selectable_text() && self.selection.has_selection() {
+            let (copy_event, shift_c) = ctx.input(|i| {
+                let copy = i
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+                let shift_c =
+                    i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C);
+                (copy, shift_c)
+            });
+            if shift_c {
+                if let Some(text) = self.selection.markdown_text() {
+                    ctx.copy_text(text);
+                }
+            } else if copy_event {
+                if let Some(text) = self.selection.plain_text() {
+                    ctx.copy_text(text);
+                }
+            }
+        }
 
         // ---- top bar --------------------------------------------------------
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -613,7 +637,13 @@ impl eframe::App for App {
                             self.show_editor(ui);
                         } else {
                             let mut area = egui::ScrollArea::vertical()
-                                .auto_shrink([false, false]);
+                                .auto_shrink([false, false])
+                                // Dragging in the document selects text, so the
+                                // scroll area must not also claim the drag for
+                                // "drag to scroll" (its default). Otherwise the
+                                // area steals every drag before the text units
+                                // see it and nothing can ever be selected.
+                                .drag_to_scroll(!self.cfg.selectable_text());
                             if let Some(y) = self.restore_offset.take() {
                                 area = area.vertical_scroll_offset(y);
                             }
@@ -1111,4 +1141,68 @@ fn save_png(path: &Path, img: &egui::ColorImage) -> Result<(), String> {
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
     let data: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
     writer.write_image_data(&data).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod copy_shortcut_tests {
+    use eframe::egui;
+    use crate::md_view::Selection;
+
+    /// The copy shortcut is read at the top of the frame, from the window's own
+    /// input, so it cannot be swallowed by a widget drawn later. This pins the
+    /// decision: which events copy, and in which format.
+    fn decide(events: &[egui::Event], mods: egui::Modifiers, c_pressed: bool) -> (bool, bool) {
+        let copy = events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+        let shift_c = mods.ctrl && mods.shift && c_pressed;
+        (copy || shift_c, shift_c)
+    }
+
+    #[test]
+    fn a_plain_copy_event_copies_plain_text() {
+        let (wants, markdown) = decide(&[egui::Event::Copy], egui::Modifiers::CTRL, false);
+        assert!(wants);
+        assert!(!markdown, "Ctrl+C keeps the readable text, not the markup");
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_markdown() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let (wants, markdown) = decide(&[], mods, true);
+        assert!(wants);
+        assert!(markdown, "Ctrl+Shift+C keeps the Markdown markers");
+    }
+
+    #[test]
+    fn a_stray_shift_does_not_flip_a_plain_copy_to_markdown() {
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        // Shift is held but no C press: a plain Event::Copy still means plain.
+        let (wants, markdown) = decide(&[egui::Event::Copy], mods, false);
+        assert!(wants);
+        assert!(!markdown);
+    }
+
+    #[test]
+    fn nothing_is_copied_without_an_event() {
+        assert_eq!(decide(&[], egui::Modifiers::NONE, false), (false, false));
+    }
+
+    /// The selection must survive the frame that paints it, or copy has nothing
+    /// to read. This is the contract `App::update` relies on.
+    #[test]
+    fn a_selection_has_text_to_copy() {
+        let sel = Selection::default();
+        assert!(!sel.has_selection());
+        assert_eq!(sel.plain_text(), None);
+        assert_eq!(sel.markdown_text(), None);
+    }
 }

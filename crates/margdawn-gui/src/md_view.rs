@@ -259,35 +259,6 @@ impl Selection {
         }
 
         self.paint(ui, geoms);
-        self.copy_on_shortcut(ui);
-    }
-
-    /// Put the selection on the clipboard when a copy shortcut is pressed.
-    ///
-    /// Ctrl+C copies the text as it reads (markup stripped); Ctrl+Shift+C keeps
-    /// the original Markdown markers so the result can be pasted into another
-    /// document. Both are no-ops without a selection, which also leaves egui's
-    /// own copy handling to any focused widget.
-    fn copy_on_shortcut(&self, ui: &egui::Ui) {
-        if !self.enabled || !self.has_selection() {
-            return;
-        }
-        let (plain_copy, markdown_copy) = ui.input(|i| {
-            let ctrl = i.modifiers.ctrl || i.modifiers.command;
-            (
-                ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::C),
-                ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C),
-            )
-        });
-        if markdown_copy {
-            if let Some(text) = self.markdown_text() {
-                ui.ctx().copy_text(text);
-            }
-        } else if plain_copy {
-            if let Some(text) = self.plain_text() {
-                ui.ctx().copy_text(text);
-            }
-        }
     }
 
     fn paint(&self, ui: &egui::Ui, geoms: &[UnitGeom]) {
@@ -1534,5 +1505,136 @@ mod tests {
         s.begin_frame(false);
         assert!(s.anchor.is_none() && s.cursor.is_none());
         assert!(!s.has_selection());
+    }
+}
+
+/// End-to-end selection: drive the real render path inside an egui context with
+/// synthetic pointer and keyboard events, then read what reached the clipboard.
+///
+/// Everything — context, fonts, layout, events — happens on one big-stack
+/// thread. An egui `Context` built on the test thread and driven from another
+/// recurses until the stack dies, so it must never be shared across threads.
+#[cfg(test)]
+mod selection_input_tests {
+    use super::*;
+    use margdawn_core::md::parse;
+
+    const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
+
+    fn run_on_big_stack(f: fn()) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, &margdawn_core::config::Config::default());
+        ctx
+    }
+
+    fn view(selectable: bool) -> View {
+        let theme = Arc::new(margdawn_core::theme::builtin("claude").expect("builtin theme"));
+        let cfg = RenderCfg {
+            font_size: 15.0,
+            line_height: 1.6,
+            paragraph_spacing: 8.0,
+            preserve_blank_lines: false,
+            code_theme: String::new(),
+            body: Face::Serif,
+            heading: Face::Serif,
+            image_max_width_percent: None,
+            selectable_text: selectable,
+        };
+        View::new(theme, cfg, Rc::new(EmojiStore::new()), Rc::new(ImageStore::new()), None)
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut View,
+        sel: &mut Selection,
+        doc: &margdawn_core::md::Document,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Default::default(), SCREEN)),
+            ..Default::default()
+        };
+        input.events = events;
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    // mirror the app: a selectable view must not let the scroll
+                    // area claim the drag for drag-to-scroll
+                    .drag_to_scroll(!view.cfg.selectable_text)
+                    .show(ui, |ui| view.render_document(ui, doc, sel));
+            });
+        })
+    }
+
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// Drag across the last registered unit and report the resulting state.
+    fn drag_and_copy(selectable: bool) -> (bool, String) {
+        let ctx = ctx();
+        // long enough that the content overflows the viewport, which is the
+        // condition under which a scroll area starts stealing drags
+        let long: String = (0..80).map(|i| format!("Paragraph {i} with some words to drag over.\n\n")).collect();
+        let doc = parse(&format!("# Title\n\n{long}"));
+        let mut v = view(selectable);
+        let mut sel = Selection::default();
+
+        frame(&ctx, &mut v, &mut sel, &doc, vec![]);
+        assert!(!v.geoms.is_empty(), "the document registered geometry");
+        // Drag the *second* paragraph: it is on screen (the first is the
+        // heading, which the app renders differently) and inside the viewport,
+        // which is where a real mouse drags.
+        let r = v.geoms[1].rect;
+        let a = egui::pos2(r.left() + 2.0, r.center().y);
+        let b = egui::pos2(r.left() + r.width() * 0.7, r.center().y);
+        let mid = egui::pos2((a.x + b.x) / 2.0, a.y);
+
+        for ev in [
+            vec![egui::Event::PointerMoved(a)],
+            vec![press(a, true)],
+            vec![egui::Event::PointerMoved(mid)],
+            vec![egui::Event::PointerMoved(b)],
+            vec![press(b, false)],
+        ] {
+            frame(&ctx, &mut v, &mut sel, &doc, ev);
+        }
+        let selected = sel.has_selection();
+        let plain = sel.plain_text().unwrap_or_default();
+
+        (selected, plain)
+    }
+
+    #[test]
+    fn dragging_over_text_records_a_selection() {
+        run_on_big_stack(|| {
+            let (selected, plain) = drag_and_copy(true);
+            assert!(selected, "a drag over the paragraph selects text");
+            assert!(!plain.trim().is_empty(), "selected text is not empty, got {plain:?}");
+        });
+    }
+
+    #[test]
+    fn with_selection_disabled_a_drag_selects_and_copies_nothing() {
+        run_on_big_stack(|| {
+            let (selected, plain) = drag_and_copy(false);
+            assert!(!selected, "selection is off, so nothing is selected");
+            assert!(plain.is_empty(), "and nothing would be copied, got {plain:?}");
+        });
     }
 }
